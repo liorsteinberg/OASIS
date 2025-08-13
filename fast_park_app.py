@@ -7,13 +7,253 @@ import osmnx as ox
 import networkx as nx
 import geopandas as gpd
 from shapely.geometry import Point, Polygon
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 import json
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 import numpy as np
 from scipy.spatial import ConvexHull
+try:
+    import networkit as nk
+    NETWORKIT_AVAILABLE = True
+except ImportError:
+    nk = None
+    NETWORKIT_AVAILABLE = False
+
+class NetworkAdapter:
+    """Abstract base class for network analysis backends"""
+    
+    def __init__(self, graph: nx.Graph):
+        self.nx_graph = graph
+        
+    def shortest_path_lengths(self, start_node: int, max_distance: float) -> Dict[int, float]:
+        """Calculate shortest path lengths from start_node within max_distance"""
+        raise NotImplementedError
+    
+    def connected_components(self, nodes: List[int]) -> List[List[int]]:
+        """Find connected components in subgraph containing given nodes"""
+        raise NotImplementedError
+    
+    def remove_edges(self, edges_to_remove: List[Tuple[int, int]]) -> 'NetworkAdapter':
+        """Create new adapter with specified edges removed"""
+        raise NotImplementedError
+
+class NetworkXAdapter(NetworkAdapter):
+    """NetworkX-based network analysis"""
+    
+    def __init__(self, graph: nx.Graph):
+        super().__init__(graph)
+        
+    def shortest_path_lengths(self, start_node: int, max_distance: float) -> Dict[int, float]:
+        """Calculate shortest path lengths using NetworkX"""
+        try:
+            return nx.single_source_dijkstra_path_length(
+                self.nx_graph, start_node, weight='length', cutoff=max_distance
+            )
+        except KeyError as e:
+            print(f"NetworkX KeyError during Dijkstra: {e}")
+            return {}
+    
+    def connected_components(self, nodes: List[int]) -> List[List[int]]:
+        """Find connected components using NetworkX"""
+        subgraph = self.nx_graph.subgraph(nodes)
+        return [list(component) for component in nx.connected_components(subgraph)]
+    
+    def remove_edges(self, edges_to_remove: List[Tuple[int, int]]) -> 'NetworkXAdapter':
+        """Create new NetworkX adapter with edges removed"""
+        new_graph = self.nx_graph.copy()
+        for edge in edges_to_remove:
+            if new_graph.has_edge(edge[0], edge[1]):
+                new_graph.remove_edge(edge[0], edge[1])
+        return NetworkXAdapter(new_graph)
+
+class NetworKitAdapter(NetworkAdapter):
+    """NetworKit-based network analysis (faster for large networks)"""
+    
+    def __init__(self, graph: nx.Graph):
+        super().__init__(graph)
+        if not NETWORKIT_AVAILABLE:
+            raise ImportError("NetworKit is not installed")
+        
+        # Convert NetworkX graph to NetworKit with fallback handling
+        self.has_weights = False  # Track if weights were successfully converted
+        
+        # NetworKit has issues with MultiGraph, so convert to simple Graph if needed
+        if isinstance(graph, (nx.MultiGraph, nx.MultiDiGraph)):
+            print("NetworKit: Converting MultiGraph to simple Graph for compatibility")
+            simple_graph = nx.Graph()
+            # Copy nodes with their attributes
+            simple_graph.add_nodes_from(graph.nodes(data=True))
+            # Copy edges, taking the first parallel edge if multiple exist
+            for u, v, data in graph.edges(data=True):
+                if not simple_graph.has_edge(u, v):
+                    simple_graph.add_edge(u, v, **data)
+            graph_for_nk = simple_graph
+        else:
+            graph_for_nk = graph
+        
+        try:
+            # First attempt: try with 'length' attribute
+            self.nk_graph = nk.nxadapter.nx2nk(graph_for_nk, weightAttr='length')
+            self.has_weights = True
+            print("NetworKit: Successfully converted with 'length' weights")
+        except KeyError as e:
+            print(f"NetworKit: Some edges missing 'length' attribute, trying fallback conversion...")
+            try:
+                # Second attempt: convert without weights
+                self.nk_graph = nk.nxadapter.nx2nk(graph_for_nk)
+                self.has_weights = False
+                print("NetworKit: Converted without edge weights (using topology only)")
+            except Exception as e2:
+                print(f"NetworKit: Conversion failed entirely: {e2}")
+                raise ImportError(f"Failed to convert NetworkX graph to NetworKit: {e2}")
+        except Exception as e:
+            print(f"NetworKit: Unexpected conversion error: {e}")
+            raise ImportError(f"Failed to convert NetworkX graph to NetworKit: {e}")
+            
+        # Create node mapping (NetworkX node IDs to NetworKit continuous IDs)
+        self.nx_to_nk = {node: i for i, node in enumerate(graph.nodes())}
+        self.nk_to_nx = {i: node for node, i in self.nx_to_nk.items()}
+        
+    def shortest_path_lengths(self, start_node: int, max_distance: float) -> Dict[int, float]:
+        """Calculate shortest path lengths using NetworKit"""
+        try:
+            if start_node not in self.nx_to_nk:
+                print(f"NetworKit: Start node {start_node} not found")
+                return {}
+            
+            # If we don't have proper edge weights, fallback to NetworkX for accurate distances
+            if not self.has_weights:
+                print("NetworKit: No edge weights available, falling back to NetworkX for distance calculation")
+                try:
+                    return nx.single_source_dijkstra_path_length(
+                        self.nx_graph, start_node, weight='length', cutoff=max_distance
+                    )
+                except KeyError as e:
+                    print(f"NetworkX fallback also failed: {e}")
+                    return {}
+                
+            nk_start = self.nx_to_nk[start_node]
+            
+            # Use NetworKit's Dijkstra algorithm with weights
+            dijkstra = nk.distance.Dijkstra(self.nk_graph, nk_start, storePaths=False)
+            dijkstra.run()
+            
+            # Convert back to NetworkX node IDs and filter by distance
+            result = {}
+            for nk_node in range(self.nk_graph.numberOfNodes()):
+                distance = dijkstra.distance(nk_node)
+                if distance <= max_distance and distance != float('inf'):
+                    nx_node = self.nk_to_nx[nk_node]
+                    result[nx_node] = distance
+                    
+            return result
+        except Exception as e:
+            print(f"NetworKit error during Dijkstra: {e}")
+            # Fallback to NetworkX if NetworKit fails
+            print("Falling back to NetworkX due to NetworKit error")
+            try:
+                return nx.single_source_dijkstra_path_length(
+                    self.nx_graph, start_node, weight='length', cutoff=max_distance
+                )
+            except Exception as e2:
+                print(f"NetworkX fallback also failed: {e2}")
+                return {}
+    
+    def connected_components(self, nodes: List[int]) -> List[List[int]]:
+        """Find connected components using NetworKit"""
+        try:
+            # Create subgraph with only specified nodes
+            nk_nodes = [self.nx_to_nk[node] for node in nodes if node in self.nx_to_nk]
+            
+            if not nk_nodes:
+                return []
+                
+            # Create induced subgraph
+            subgraph = nk.graphtools.subgraphFromNodes(self.nk_graph, nk_nodes)
+            
+            # Find connected components
+            cc = nk.components.ConnectedComponents(subgraph)
+            cc.run()
+            
+            # Convert back to NetworkX node IDs
+            components = []
+            component_map = cc.getPartition()
+            
+            # Group nodes by component
+            component_dict = {}
+            for i, nk_node in enumerate(nk_nodes):
+                comp_id = component_map[i]
+                if comp_id not in component_dict:
+                    component_dict[comp_id] = []
+                component_dict[comp_id].append(self.nk_to_nx[nk_node])
+            
+            return list(component_dict.values())
+        except Exception as e:
+            print(f"NetworKit error during connected components: {e}")
+            # Fallback to NetworkX
+            subgraph = self.nx_graph.subgraph(nodes)
+            return [list(component) for component in nx.connected_components(subgraph)]
+    
+    def remove_edges(self, edges_to_remove: List[Tuple[int, int]]) -> 'NetworKitAdapter':
+        """Create new NetworKit adapter with edges removed"""
+        # For edge removal, we need to work with the NetworkX graph and recreate
+        new_nx_graph = self.nx_graph.copy()
+        for edge in edges_to_remove:
+            if new_nx_graph.has_edge(edge[0], edge[1]):
+                new_nx_graph.remove_edge(edge[0], edge[1])
+        return NetworKitAdapter(new_nx_graph)
+
+def validate_graph_for_networkit(graph: nx.Graph) -> Dict:
+    """Validate graph edges for NetworKit compatibility"""
+    total_edges = graph.number_of_edges()
+    edges_with_length = 0
+    edges_without_length = 0
+    sample_edge_attrs = []
+    
+    for u, v, data in graph.edges(data=True):
+        if 'length' in data:
+            edges_with_length += 1
+        else:
+            edges_without_length += 1
+            if len(sample_edge_attrs) < 3:  # Collect sample of problematic edges
+                sample_edge_attrs.append((u, v, list(data.keys())))
+        
+        if edges_with_length + edges_without_length >= 1000:  # Sample first 1000 edges
+            break
+    
+    result = {
+        'total_edges_sampled': min(total_edges, 1000),
+        'edges_with_length': edges_with_length,
+        'edges_without_length': edges_without_length,
+        'percentage_with_length': (edges_with_length / min(total_edges, 1000)) * 100,
+        'sample_problematic_edges': sample_edge_attrs
+    }
+    
+    print(f"Graph validation: {edges_with_length}/{min(total_edges, 1000)} edges have 'length' attribute ({result['percentage_with_length']:.1f}%)")
+    if edges_without_length > 0:
+        print(f"Sample edges without 'length': {sample_edge_attrs[:2]}")
+    
+    return result
+
+def create_network_adapter(graph: nx.Graph, backend: str = "networkx") -> NetworkAdapter:
+    """Factory function to create appropriate network adapter"""
+    if backend.lower() == "networkit":
+        if not NETWORKIT_AVAILABLE:
+            print("Warning: NetworKit not available, falling back to NetworkX")
+            return NetworkXAdapter(graph)
+        
+        # Add diagnostic validation
+        validation = validate_graph_for_networkit(graph)
+        
+        try:
+            return NetworKitAdapter(graph)
+        except ImportError as e:
+            print(f"Warning: NetworKit initialization failed ({e}), falling back to NetworkX")
+            return NetworkXAdapter(graph)
+    else:
+        return NetworkXAdapter(graph)
 
 app = FastAPI(title="Fast Park Accessibility", version="1.0.0")
 
@@ -31,6 +271,10 @@ executor = ThreadPoolExecutor(max_workers=4)
 
 # Global cache for loaded data
 DATA_CACHE = {}
+
+# Global progress tracking
+LOADING_PROGRESS = {}
+MASS_ANALYSIS_PROGRESS = {}
 
 class ParkAccessibilityAnalyzer:
     def __init__(self):
@@ -51,44 +295,95 @@ class ParkAccessibilityAnalyzer:
         return data
     
     def _load_data_sync(self, lat: float, lng: float, radius: int) -> Dict:
-        """Synchronous data loading"""
+        """Synchronous data loading with progress tracking"""
         print(f"Starting data load for {lat}, {lng}, {radius}")
         
+        # Create unique progress key for this request
+        progress_key = f"{lat:.4f}_{lng:.4f}_{radius}"
+        
+        total_steps = 9
+        current_step = 0
+        
+        def log_progress(step_name: str):
+            nonlocal current_step
+            current_step += 1
+            progress_info = {
+                'current_step': current_step,
+                'total_steps': total_steps,
+                'step_name': step_name,
+                'completed': False
+            }
+            LOADING_PROGRESS[progress_key] = progress_info
+            print(f"Step {current_step}/{total_steps}: {step_name}")
+        
         try:
-            # Load parks
-            print("Loading parks...")
+            # Step 1: Load parks from OpenStreetMap
+            log_progress("Loading parks from OpenStreetMap...")
             tags = {"leisure": ["park", "recreation_ground"], "landuse": ["grass", "recreation_ground"]}
             parks = ox.features_from_point((lat, lng), tags=tags, dist=radius)
             print(f"Raw parks loaded: {len(parks)}")
             
+            # Step 2: Filter and process park geometries
+            log_progress("Filtering park geometries...")
             parks = parks[parks.geometry.geom_type.isin(["Polygon", "MultiPolygon"])].copy()
             print(f"Filtered parks: {len(parks)}")
             
             if not parks.empty:
                 parks["area_m2"] = parks.geometry.to_crs(3857).area
-                # parks = parks[parks.area_m2 > 500].head(50)  # Limit for performance
                 print(f"Final parks: {len(parks)}")
             
-            # Load street network
-            print("Loading street network...")
+            # Step 3: Load street network from OpenStreetMap
+            log_progress("Loading street network from OpenStreetMap...")
             graph = ox.graph_from_point((lat, lng), dist=radius, network_type='walk')
             print(f"Graph loaded: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges")
             
-            # Add edge lengths using current OSMnx API
-            print("Adding edge lengths...")
+            # Step 4: Calculate edge lengths and weights
+            log_progress("Calculating street lengths and weights...")
             graph = ox.distance.add_edge_lengths(graph)
             print("Edge lengths added")
                 
-            print("Converting to undirected...")
+            # Step 5: Convert to undirected graph
+            log_progress("Converting to undirected graph...")
             graph_undirected = graph.to_undirected()
             print("Converted to undirected")
             
-            print("Converting to GeoDataFrames...")
+            # Step 5b: Ensure all edges in undirected graph have lengths
+            log_progress("Validating edge lengths in undirected graph...")
+            missing_lengths = 0
+            total_edges = 0
+            for u, v, data in graph_undirected.edges(data=True):
+                total_edges += 1
+                if 'length' not in data:
+                    missing_lengths += 1
+                    # Calculate length from node coordinates as fallback
+                    try:
+                        node_u = graph_undirected.nodes[u]
+                        node_v = graph_undirected.nodes[v]
+                        if 'x' in node_u and 'y' in node_u and 'x' in node_v and 'y' in node_v:
+                            # Calculate Euclidean distance as approximation
+                            import math
+                            dx = node_v['x'] - node_u['x']
+                            dy = node_v['y'] - node_u['y']
+                            # Convert degrees to approximate meters (rough approximation)
+                            # 1 degree ≈ 111,000 meters at equator
+                            distance_m = math.sqrt(dx*dx + dy*dy) * 111000
+                            graph_undirected[u][v]['length'] = distance_m
+                    except Exception as e:
+                        # Last resort: set a default length
+                        graph_undirected[u][v]['length'] = 50.0  # 50 meter default
+            
+            if missing_lengths > 0:
+                print(f"Fixed {missing_lengths}/{total_edges} edges missing length attributes")
+            else:
+                print(f"All {total_edges} edges have length attributes")
+            
+            # Step 6: Create geographic data frames
+            log_progress("Creating geographic data frames...")
             nodes_gdf, edges_gdf = ox.graph_to_gdfs(graph)
             print(f"GDFs created: {len(nodes_gdf)} nodes, {len(edges_gdf)} edges")
             
-            # Convert to serializable format
-            print("Converting parks to serializable format...")
+            # Step 7: Process parks for visualization
+            log_progress("Processing parks for web display...")
             parks_data = []
             for idx, park in parks.iterrows():
                 try:
@@ -114,7 +409,8 @@ class ParkAccessibilityAnalyzer:
                     print(f"Error processing park {idx}: {e}")
                     continue
             
-            print("Converting nodes to serializable format...")
+            # Step 8: Process nodes for web interface
+            log_progress("Processing street nodes for selection...")
             nodes_data = []
             for node_id, node_data in nodes_gdf.iterrows():
                 try:
@@ -136,6 +432,24 @@ class ParkAccessibilityAnalyzer:
             
             print(f"Data preparation complete: {len(parks_data)} parks, {len(nodes_data)} nodes")
             
+            # Mark progress as completed
+            LOADING_PROGRESS[progress_key] = {
+                'current_step': total_steps,
+                'total_steps': total_steps,
+                'step_name': 'Data loading complete!',
+                'completed': True
+            }
+            
+            # Clean up old progress entries to prevent memory leaks
+            import time
+            current_time = time.time()
+            for key in list(LOADING_PROGRESS.keys()):
+                progress = LOADING_PROGRESS[key]
+                if progress.get('completed') and not hasattr(progress, 'cleanup_time'):
+                    progress['cleanup_time'] = current_time
+                elif progress.get('cleanup_time') and (current_time - progress['cleanup_time']) > 300:  # 5 minutes
+                    del LOADING_PROGRESS[key]
+            
             return {
                 'parks': parks_data,
                 # 'nodes': nodes_data[:200],  # Limit nodes for UI performance
@@ -148,6 +462,14 @@ class ParkAccessibilityAnalyzer:
             }
             
         except Exception as e:
+            # Mark progress as failed
+            LOADING_PROGRESS[progress_key] = {
+                'current_step': current_step,
+                'total_steps': total_steps,
+                'step_name': f'Error: {str(e)}',
+                'completed': True,
+                'error': True
+            }
             print(f"Exception in _load_data_sync: {e}")
             import traceback
             traceback.print_exc()
@@ -155,7 +477,8 @@ class ParkAccessibilityAnalyzer:
     
     async def calculate_accessibility(self, lat: float, lng: float, radius: int, 
                                    park_id: str, node_id: str, walk_time: float = 10.0, 
-                                   walk_speed: float = 4.5, viz_method: str = "convex_hull") -> Dict:
+                                   walk_speed: float = 4.5, viz_method: str = "convex_hull",
+                                   network_backend: str = "networkit") -> Dict:
         """Calculate accessibility with and without park"""
         # Get cached data
         cache_key = f"{lat:.4f}_{lng:.4f}_{radius}"
@@ -168,13 +491,252 @@ class ParkAccessibilityAnalyzer:
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             executor, self._calculate_accessibility_sync, 
-            data, park_id, node_id, walk_time, walk_speed, viz_method
+            data, park_id, node_id, walk_time, walk_speed, viz_method, network_backend
         )
         
         return result
     
+    async def calculate_mass_accessibility(self, lat: float, lng: float, radius: int, 
+                                         park_id: str, node_ids: List[str], walk_time: float = 10.0, 
+                                         walk_speed: float = 4.5, viz_method: str = "convex_hull",
+                                         network_backend: str = "networkit") -> Dict:
+        """Calculate accessibility for multiple nodes in parallel with shared resources"""
+        # Get cached data
+        cache_key = f"{lat:.4f}_{lng:.4f}_{radius}"
+        if cache_key not in DATA_CACHE:
+            await self.load_area_data(lat, lng, radius)
+        
+        data = DATA_CACHE[cache_key]
+        
+        # Generate progress key immediately
+        import time
+        progress_key = f"mass_{park_id}_{int(time.time())}"
+        
+        # Initialize progress tracking
+        MASS_ANALYSIS_PROGRESS[progress_key] = {
+            'total_nodes': len(node_ids),
+            'completed_nodes': 0,
+            'current_node': None,
+            'completed': False,
+            'start_time': time.time()
+        }
+        
+        # Run batch analysis in thread pool
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(
+            executor, self._calculate_mass_accessibility_sync, 
+            data, park_id, node_ids, walk_time, walk_speed, viz_method, network_backend, progress_key
+        )
+        
+        return results
+    
+    async def calculate_mass_accessibility_background(self, lat: float, lng: float, radius: int, 
+                                         park_id: str, node_ids: List[str], walk_time: float = 10.0, 
+                                         walk_speed: float = 4.5, viz_method: str = "convex_hull",
+                                         network_backend: str = "networkit", progress_key: str = None):
+        """Background task for mass accessibility calculation"""
+        try:
+            # Get cached data
+            cache_key = f"{lat:.4f}_{lng:.4f}_{radius}"
+            if cache_key not in DATA_CACHE:
+                await self.load_area_data(lat, lng, radius)
+            
+            data = DATA_CACHE[cache_key]
+            
+            # Run batch analysis in thread pool
+            loop = asyncio.get_event_loop()
+            results = await loop.run_in_executor(
+                executor, self._calculate_mass_accessibility_sync, 
+                data, park_id, node_ids, walk_time, walk_speed, viz_method, network_backend, progress_key
+            )
+            
+            # Store results in progress tracking
+            MASS_ANALYSIS_PROGRESS[progress_key]['results'] = results
+            
+        except Exception as e:
+            print(f"Background task error: {e}")
+            import traceback
+            traceback.print_exc()
+            # Mark progress as failed
+            if progress_key and progress_key in MASS_ANALYSIS_PROGRESS:
+                MASS_ANALYSIS_PROGRESS[progress_key]['completed'] = True
+                MASS_ANALYSIS_PROGRESS[progress_key]['error'] = str(e)
+    
+    def _calculate_mass_accessibility_sync(self, data: Dict, park_id: str, node_ids: List[str],
+                                         walk_time: float, walk_speed: float, viz_method: str,
+                                         network_backend: str, progress_key: str) -> List[Dict]:
+        """Synchronous mass accessibility calculation with parallel processing and shared resources"""
+        print(f"Starting mass accessibility calculation for park {park_id}, {len(node_ids)} nodes")
+        
+        import time
+        
+        try:
+            graph = data['graph']
+            parks_gdf = data['parks_gdf']
+            nodes_gdf = data['nodes_gdf']
+            
+            # Validate park exists
+            park_key = None
+            for idx, park_data in parks_gdf.iterrows():
+                if str(idx) == park_id:
+                    park_key = idx
+                    break
+            
+            if park_key is None:
+                raise KeyError(f"Park {park_id} not found in parks_gdf")
+            
+            # Get park geometry and pre-calculate edge removal (shared resource)
+            park_geom = parks_gdf.loc[park_key].geometry
+            edges_to_remove = self._get_park_edges(graph, nodes_gdf, park_geom)
+            print(f"Pre-calculated {len(edges_to_remove)} park edges to remove")
+            
+            # Create shared network adapters (expensive operations done once)
+            print(f"Creating shared network adapters with backend: {network_backend}")
+            with_park_adapter = create_network_adapter(graph, network_backend)
+            without_park_adapter = with_park_adapter.remove_edges(edges_to_remove)
+            print("Shared network adapters created")
+            
+            # Walking parameters
+            walking_speed_ms = (walk_speed * 1000) / 60  # km/h to m/min
+            max_distance = walk_time * walking_speed_ms  # walking time in minutes
+            
+            # Process nodes in parallel
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            results = []
+            
+            def process_single_node(node_id: str) -> Dict:
+                """Process a single node with shared resources"""
+                try:
+                    # Validate node exists
+                    node_key = int(node_id)
+                    if node_key not in nodes_gdf.index:
+                        raise KeyError(f"Node {node_id} not found in nodes_gdf")
+                    
+                    if node_key not in graph:
+                        raise Exception(f"Node {node_key} not found in graph")
+                    
+                    print(f"Processing node {node_id}...")
+                    
+                    # Calculate WITH park using shared adapter
+                    with_park = self._calculate_isochrone(with_park_adapter, nodes_gdf, data['edges_gdf'], 
+                                                        node_key, max_distance, viz_method)
+                    
+                    # Calculate WITHOUT park using shared adapter 
+                    without_park = self._calculate_isochrone(without_park_adapter, nodes_gdf, data['edges_gdf'],
+                                                           node_key, max_distance, viz_method)
+                    
+                    # Calculate metrics (same as single node analysis)
+                    area_difference = without_park['area_km2'] - with_park['area_km2']
+                    street_network_difference = without_park['street_network_stats']['total_length_km'] - with_park['street_network_stats']['total_length_km']
+                    node_difference = without_park['reachable_nodes'] - with_park['reachable_nodes']
+                    edge_difference = without_park['street_network_stats']['edge_count'] - with_park['street_network_stats']['edge_count']
+                    
+                    # Calculate percentage changes
+                    area_change_pct = (area_difference / with_park['area_km2'] * 100) if with_park['area_km2'] > 0 else 0
+                    street_network_change_pct = (street_network_difference / with_park['street_network_stats']['total_length_km'] * 100) if with_park['street_network_stats']['total_length_km'] > 0 else 0
+                    
+                    # Determine impact category
+                    if street_network_change_pct < -5:
+                        impact_category = 'highly_positive'
+                        impact_label = 'Highly Positive'
+                    elif street_network_change_pct < -1:
+                        impact_category = 'positive'
+                        impact_label = 'Positive'
+                    elif street_network_change_pct > 5:
+                        impact_category = 'highly_negative'
+                        impact_label = 'Highly Negative'
+                    elif street_network_change_pct > 1:
+                        impact_category = 'negative'
+                        impact_label = 'Negative'
+                    else:
+                        impact_category = 'neutral'
+                        impact_label = 'Neutral'
+                    
+                    return {
+                        'node_id': node_id,
+                        'with_park': with_park,
+                        'without_park': without_park,
+                        'difference_km2': area_difference,
+                        'street_network_difference_km': street_network_difference,
+                        'node_difference': node_difference,
+                        'edge_difference': edge_difference,
+                        'area_change_pct': area_change_pct,
+                        'street_network_change_pct': street_network_change_pct,
+                        'impact_category': impact_category,
+                        'impact_label': impact_label,
+                        'park_id': park_id,
+                        'enhanced_metrics': {
+                            'with_connectivity': with_park['connectivity_stats']['connectivity_ratio'],
+                            'without_connectivity': without_park['connectivity_stats']['connectivity_ratio'],
+                            'connectivity_change': without_park['connectivity_stats']['connectivity_ratio'] - with_park['connectivity_stats']['connectivity_ratio'],
+                            'with_avg_distance': with_park['distance_stats']['mean_distance'],
+                            'without_avg_distance': without_park['distance_stats']['mean_distance'],
+                            'with_street_length_km': with_park['street_network_stats']['total_length_km'],
+                            'without_street_length_km': without_park['street_network_stats']['total_length_km'],
+                            'with_street_density': with_park['street_network_stats']['street_density_km_per_km2'],
+                            'without_street_density': without_park['street_network_stats']['street_density_km_per_km2']
+                        }
+                    }
+                except Exception as e:
+                    print(f"Error processing node {node_id}: {e}")
+                    return {
+                        'node_id': node_id,
+                        'error': str(e),
+                        'park_id': park_id
+                    }
+            
+            # Process nodes in parallel
+            max_workers = min(6, len(node_ids))  # Limit concurrent workers
+            with ThreadPoolExecutor(max_workers=max_workers) as parallel_executor:
+                future_to_node = {parallel_executor.submit(process_single_node, node_id): node_id 
+                                for node_id in node_ids}
+                
+                for future in as_completed(future_to_node):
+                    node_id = future_to_node[future]
+                    try:
+                        result = future.result()
+                        results.append(result)
+                        
+                        # Update progress
+                        MASS_ANALYSIS_PROGRESS[progress_key]['completed_nodes'] = len(results)
+                        MASS_ANALYSIS_PROGRESS[progress_key]['current_node'] = node_id
+                        
+                        print(f"Completed node {node_id} ({len(results)}/{len(node_ids)})")
+                    except Exception as e:
+                        print(f"Node {node_id} failed: {e}")
+                        results.append({
+                            'node_id': node_id,
+                            'error': str(e),
+                            'park_id': park_id
+                        })
+                        
+                        # Update progress even for failed nodes
+                        MASS_ANALYSIS_PROGRESS[progress_key]['completed_nodes'] = len(results)
+                        MASS_ANALYSIS_PROGRESS[progress_key]['current_node'] = f"{node_id} (failed)"
+            
+            # Mark progress as completed
+            MASS_ANALYSIS_PROGRESS[progress_key]['completed'] = True
+            MASS_ANALYSIS_PROGRESS[progress_key]['current_node'] = "Complete"
+            
+            print(f"Mass accessibility calculation complete: {len(results)} results")
+            
+            # Return just the results array
+            return results
+            
+        except Exception as e:
+            # Mark progress as failed
+            if 'progress_key' in locals():
+                MASS_ANALYSIS_PROGRESS[progress_key]['completed'] = True
+                MASS_ANALYSIS_PROGRESS[progress_key]['error'] = str(e)
+            
+            print(f"Exception in _calculate_mass_accessibility_sync: {e}")
+            import traceback
+            traceback.print_exc()
+            raise Exception(f"Failed to calculate mass accessibility: {str(e)}")
+    
     def _calculate_accessibility_sync(self, data: Dict, park_id: str, node_id: str, 
-                                     walk_time: float, walk_speed: float, viz_method: str) -> Dict:
+                                     walk_time: float, walk_speed: float, viz_method: str,
+                                     network_backend: str = "networkit") -> Dict:
         """Synchronous accessibility calculation"""
         print(f"Starting accessibility calculation for park {park_id}, node {node_id}")
         
@@ -218,16 +780,22 @@ class ParkAccessibilityAnalyzer:
             max_distance = walk_time * walking_speed_ms  # walking time in minutes
             
             print(f"Calculating WITH park (park_key: {park_key}, node_key: {node_key})...")
+            print(f"Using network backend: {network_backend}")
+            
             # Get park geometry for enhanced analysis
             park_geom = parks_gdf.loc[park_key].geometry
             
+            # Create network adapter for the selected backend
+            network_adapter = create_network_adapter(graph, network_backend)
+            
             # Calculate WITH park
-            with_park = self._calculate_isochrone(graph, nodes_gdf, data['edges_gdf'], node_key, max_distance, viz_method)
+            with_park = self._calculate_isochrone(network_adapter, nodes_gdf, data['edges_gdf'], node_key, max_distance, viz_method)
             
             print("Calculating WITHOUT park...")
-            # Calculate WITHOUT park
-            filtered_graph = self._remove_park_edges(graph, nodes_gdf, park_geom)
-            without_park = self._calculate_isochrone(filtered_graph, nodes_gdf, data['edges_gdf'], node_key, max_distance, viz_method)
+            # Calculate WITHOUT park - remove park edges and create new adapter
+            edges_to_remove = self._get_park_edges(graph, nodes_gdf, park_geom)
+            filtered_adapter = network_adapter.remove_edges(edges_to_remove)
+            without_park = self._calculate_isochrone(filtered_adapter, nodes_gdf, data['edges_gdf'], node_key, max_distance, viz_method)
             
             print("Accessibility calculation complete")
             
@@ -290,24 +858,22 @@ class ParkAccessibilityAnalyzer:
             traceback.print_exc()
             raise Exception(f"Failed to calculate accessibility: {str(e)}")
     
-    def _calculate_isochrone(self, graph: nx.Graph, nodes_gdf: gpd.GeoDataFrame, 
+    def _calculate_isochrone(self, network_adapter: NetworkAdapter, nodes_gdf: gpd.GeoDataFrame, 
                            edges_gdf: gpd.GeoDataFrame, start_node: int, max_distance: float, 
                            viz_method: str = "convex_hull", park_geometry=None) -> Dict:
         """Calculate isochrone for a node with enhanced metrics"""
-        if start_node not in graph:
+        if start_node not in network_adapter.nx_graph:
             print(f"Start node {start_node} not found in graph")
             return self._empty_isochrone_result()
         
         try:
             print(f"Finding reachable nodes from {start_node} within {max_distance}m")
             
-            # Find reachable nodes using Dijkstra with error handling
-            try:
-                lengths = nx.single_source_dijkstra_path_length(
-                    graph, start_node, weight='length', cutoff=max_distance
-                )
-            except KeyError as e:
-                print(f"KeyError during Dijkstra: {e}")
+            # Find reachable nodes using network adapter
+            lengths = network_adapter.shortest_path_lengths(start_node, max_distance)
+            
+            if not lengths:
+                print("No reachable nodes found")
                 return self._empty_isochrone_result()
             
             reachable_nodes = list(lengths.keys())
@@ -326,9 +892,8 @@ class ParkAccessibilityAnalyzer:
                 'std_distance': np.std(distances)
             }
             
-            # Analyze connectivity
-            reachable_subgraph = graph.subgraph(reachable_nodes)
-            connected_components = list(nx.connected_components(reachable_subgraph))
+            # Analyze connectivity using network adapter
+            connected_components = network_adapter.connected_components(reachable_nodes)
             connectivity_stats = {
                 'connected_components': len(connected_components),
                 'largest_component_size': max(len(comp) for comp in connected_components) if connected_components else 0,
@@ -357,13 +922,13 @@ class ParkAccessibilityAnalyzer:
             
             # Choose visualization method and calculate area
             if viz_method == "buffered_network":
-                area_result = self._create_buffered_network_isochrone(graph, edges_gdf, reachable_nodes, max_distance)
+                area_result = self._create_buffered_network_isochrone(network_adapter.nx_graph, edges_gdf, reachable_nodes, max_distance)
             else:
                 points_array = np.array(points)
                 area_result = self._create_convex_hull_isochrone(points_array, reachable_nodes)
             
             # Calculate reachable street network metrics
-            street_network_stats = self._calculate_street_network_stats(graph, edges_gdf, reachable_nodes, area_result['area_km2'])
+            street_network_stats = self._calculate_street_network_stats(network_adapter.nx_graph, edges_gdf, reachable_nodes, area_result['area_km2'])
             
             # Compile enhanced result
             result = {
@@ -556,10 +1121,10 @@ class ParkAccessibilityAnalyzer:
             traceback.print_exc()
             return {'boundary': [], 'area_km2': 0, 'reachable_nodes': len(reachable_nodes)}
     
-    def _remove_park_edges(self, graph: nx.Graph, nodes_gdf: gpd.GeoDataFrame, 
-                          park_geom) -> nx.Graph:
-        """Remove edges that intersect with park"""
-        filtered_graph = graph.copy()
+    def _get_park_edges(self, graph: nx.Graph, nodes_gdf: gpd.GeoDataFrame, 
+                       park_geom) -> List[Tuple[int, int]]:
+        """Get list of edges that intersect with park"""
+        edges_to_remove = []
         
         try:
             # Get edges as GeoDataFrame
@@ -573,17 +1138,31 @@ class ParkAccessibilityAnalyzer:
             intersects = edges_proj.geometry.intersects(park_proj)
             intersecting_edges = edges_proj[intersects]
             
-            # Remove from graph
+            # Collect edge tuples to remove
             for edge_idx in intersecting_edges.index:
                 try:
                     u, v, k = edge_idx
-                    if filtered_graph.has_edge(u, v, k):
-                        filtered_graph.remove_edge(u, v, k)
+                    # For NetworkX multigraphs, we only need (u, v) for removal
+                    edges_to_remove.append((u, v))
                 except:
                     continue
                     
         except Exception as e:
-            pass  # Return original graph if filtering fails
+            print(f"Error finding park edges: {e}")
+        
+        return edges_to_remove
+    
+    def _remove_park_edges(self, graph: nx.Graph, nodes_gdf: gpd.GeoDataFrame, 
+                          park_geom) -> nx.Graph:
+        """Remove edges that intersect with park (legacy method)"""
+        # Get edges to remove
+        edges_to_remove = self._get_park_edges(graph, nodes_gdf, park_geom)
+        
+        # Create new graph with edges removed
+        filtered_graph = graph.copy()
+        for edge in edges_to_remove:
+            if filtered_graph.has_edge(edge[0], edge[1]):
+                filtered_graph.remove_edge(edge[0], edge[1])
         
         return filtered_graph
 
@@ -904,14 +1483,50 @@ async def read_index():
                     </select>
                 </div>
                 <div class="control-group">
-                    <label>&nbsp;</label>
-                    <button class="btn" onclick="runAnalysis()" disabled id="analyzeBtn">Single Node Analysis</button>
+                    <label for="networkBackend">Network Analysis:</label>
+                    <select id="networkBackend">
+                        <option value="networkx">NetworkX (Stable)</option>
+                        <option value="networkit" selected>NetworKit (Faster)</option>
+                    </select>
                 </div>
             </div>
         </div>
 
         <div class="step">
-            <h3>Step 4: Mass Analysis (Optional)</h3>
+            <h3>Step 4: Single Node Analysis</h3>
+            <p>Run accessibility analysis for the selected park and node to see the impact.</p>
+            <div class="controls">
+                <div class="control-group">
+                    <label>&nbsp;</label>
+                    <button class="btn" onclick="runAnalysis()" disabled id="analyzeBtn">🔍 Run Single Analysis</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="results" class="results">
+            <h3>📊 Single Node Results</h3>
+            <div id="metrics" class="metrics"></div>
+            
+            <div class="step">
+                <h4>🔍 Enhanced Metrics</h4>
+                <div id="enhancedMetrics" class="enhanced-metrics"></div>
+            </div>
+            
+            <div class="step">
+                <h4>📈 Visual Analysis</h4>
+                <div class="charts-grid">
+                    <div class="chart-container">
+                        <canvas id="comparisonChart"></canvas>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="detailedMetricsChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="step">
+            <h3>Step 5: Mass Analysis (Optional)</h3>
             <p>Analyze multiple nodes around the selected park to get comprehensive statistics about the park's accessibility impact.</p>
             <div class="controls">
                 <div class="control-group">
@@ -938,28 +1553,6 @@ async def read_index():
                     <div id="massProgressBar" style="background-color: #28a745; height: 20px; border-radius: 7px; width: 0%; transition: width 0.3s;"></div>
                 </div>
                 <div id="massProgressText">Analyzing node 0/10...</div>
-            </div>
-        </div>
-
-        <div id="results" class="results">
-            <h3>📊 Single Node Results</h3>
-            <div id="metrics" class="metrics"></div>
-            
-            <div class="step">
-                <h4>🔍 Enhanced Metrics</h4>
-                <div id="enhancedMetrics" class="enhanced-metrics"></div>
-            </div>
-            
-            <div class="step">
-                <h4>📈 Visual Analysis</h4>
-                <div class="charts-grid">
-                    <div class="chart-container">
-                        <canvas id="comparisonChart"></canvas>
-                    </div>
-                    <div class="chart-container">
-                        <canvas id="detailedMetricsChart"></canvas>
-                    </div>
-                </div>
             </div>
         </div>
 
@@ -1390,10 +1983,35 @@ async def read_index():
             const lng = parseFloat(document.getElementById('lng').value);
             const radius = parseInt(document.getElementById('radius').value);
 
-            showStatus('Loading parks and street network...', 'loading');
+            showStatus('Starting data loading...', 'loading');
+            
+            // Poll for real progress from backend
+            let progressInterval = setInterval(async () => {
+                try {
+                    const progressResponse = await fetch(`/progress?lat=${lat}&lng=${lng}&radius=${radius}`);
+                    const progress = await progressResponse.json();
+                    
+                    if (progress.error) {
+                        clearInterval(progressInterval);
+                        showStatus(`Error: ${progress.step_name}`, 'error');
+                        return;
+                    }
+                    
+                    const statusText = `Step ${progress.current_step}/${progress.total_steps}: ${progress.step_name}`;
+                    showStatus(statusText, 'loading');
+                    
+                    if (progress.completed) {
+                        clearInterval(progressInterval);
+                    }
+                } catch (error) {
+                    console.log('Progress polling error:', error);
+                    // Continue polling even if progress request fails
+                }
+            }, 500); // Poll every 500ms for real-time updates
             
             try {
                 const response = await fetch(`/load-data?lat=${lat}&lng=${lng}&radius=${radius}`);
+                clearInterval(progressInterval); // Stop progress polling
                 const data = await response.json();
                 
                 if (!response.ok) {
@@ -1450,6 +2068,7 @@ async def read_index():
                 setTimeout(hideStatus, 3000);
                 
             } catch (error) {
+                clearInterval(progressInterval); // Stop progress polling on error
                 showStatus(`Error: ${error.message}`, 'error');
                 setTimeout(hideStatus, 5000);
             }
@@ -1620,6 +2239,7 @@ async def read_index():
             const walkTime = parseFloat(document.getElementById('walkTime').value);
             const walkSpeed = parseFloat(document.getElementById('walkSpeed').value);
             const vizMethod = document.getElementById('vizMethod').value;
+            const networkBackend = document.getElementById('networkBackend').value;
             
             if (!parkId || !nodeId) {
                 alert('Please select both a park and a node');
@@ -1627,7 +2247,8 @@ async def read_index():
             }
 
             const methodName = vizMethod === 'buffered_network' ? 'Buffered Streets' : 'Convex Hull';
-            showStatus(`Calculating ${walkTime}-minute accessibility (${methodName})...`, 'loading');
+            const backendName = networkBackend === 'networkit' ? 'NetworKit' : 'NetworkX';
+            showStatus(`Calculating ${walkTime}-minute accessibility (${methodName} + ${backendName})...`, 'loading');
             document.getElementById('analyzeBtn').disabled = true;
             
             try {
@@ -1636,7 +2257,8 @@ async def read_index():
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         lat, lng, radius, park_id: parkId, node_id: nodeId,
-                        walk_time: walkTime, walk_speed: walkSpeed, viz_method: vizMethod
+                        walk_time: walkTime, walk_speed: walkSpeed, viz_method: vizMethod,
+                        network_backend: networkBackend
                     })
                 });
                 
@@ -1930,6 +2552,7 @@ async def read_index():
             const walkTime = parseFloat(document.getElementById('walkTime').value);
             const walkSpeed = parseFloat(document.getElementById('walkSpeed').value);
             const vizMethod = document.getElementById('vizMethod').value;
+            const networkBackend = document.getElementById('networkBackend').value;
             
             if (!parkId) {
                 alert('Please select a park first');
@@ -1968,68 +2591,138 @@ async def read_index():
             const lng = parseFloat(document.getElementById('lng').value);
             const radius = parseInt(document.getElementById('radius').value);
 
-            for (let i = 0; i < selectedNodes.length; i++) {
-                const node = selectedNodes[i];
-                
-                // Update progress
-                const progress = ((i + 1) / selectedNodes.length) * 100;
-                document.getElementById('massProgressBar').style.width = progress + '%';
+            // Extract node IDs for batch processing
+            const nodeIds = selectedNodes.map(node => node.id);
+            
+            try {
+                // Show initial progress
+                document.getElementById('massProgressBar').style.width = '10%';
                 document.getElementById('massProgressText').textContent = 
-                    `Analyzing node ${i + 1}/${selectedNodes.length}... (${node.id})`;
+                    `Starting batch analysis of ${nodeIds.length} nodes...`;
 
-                try {
-                    const response = await fetch('/analyze', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            lat, lng, radius, 
-                            park_id: parkId, 
-                            node_id: node.id,
-                            walk_time: walkTime, 
-                            walk_speed: walkSpeed, 
-                            viz_method: vizMethod
-                        })
-                    });
-                    
-                    const result = await response.json();
-                    
-                    if (response.ok) {
+                // Start batch request and get progress key immediately
+                const response = await fetch('/mass-analyze', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        lat, lng, radius, 
+                        park_id: parkId, 
+                        node_ids: nodeIds,
+                        walk_time: walkTime, 
+                        walk_speed: walkSpeed, 
+                        viz_method: vizMethod,
+                        network_backend: networkBackend
+                    })
+                });
+                
+                if (!response.ok) {
+                    throw new Error('Failed to start batch analysis');
+                }
+                
+                const batchData = await response.json();
+                const progressKey = batchData.progress_key;
+                
+                let results = null;
+                
+                // Poll for real-time progress updates
+                let progressInterval = setInterval(async () => {
+                    try {
+                        const progressResponse = await fetch(`/mass-progress?progress_key=${progressKey}`);
+                        const progress = await progressResponse.json();
+                        
+                        const percentage = Math.min((progress.completed_nodes / progress.total_nodes) * 100, 100);
+                        document.getElementById('massProgressBar').style.width = percentage + '%';
+                        
+                        if (progress.current_node && progress.current_node !== 'Not found') {
+                            document.getElementById('massProgressText').textContent = 
+                                `Analyzing node ${progress.completed_nodes}/${progress.total_nodes}... (${progress.current_node})`;
+                        }
+                        
+                        if (progress.completed) {
+                            clearInterval(progressInterval);
+                            results = progress.results;
+                            document.getElementById('massProgressText').textContent = 'Processing results...';
+                        }
+                    } catch (error) {
+                        console.log('Progress polling error:', error);
+                    }
+                }, 500); // Poll every 500ms
+                
+                // Wait for completion through progress polling
+                await new Promise(resolve => {
+                    let checkComplete = setInterval(async () => {
+                        try {
+                            const progressResponse = await fetch(`/mass-progress?progress_key=${progressKey}`);
+                            const progress = await progressResponse.json();
+                            if (progress.completed) {
+                                clearInterval(checkComplete);
+                                results = progress.results;
+                                resolve();
+                            }
+                        } catch (error) {
+                            console.log('Completion check error:', error);
+                        }
+                    }, 500);
+                });
+                
+                document.getElementById('massProgressBar').style.width = '90%';
+                document.getElementById('massProgressText').textContent = 'Processing batch results...';
+                
+                if (response.ok) {
+                    // Process batch results
+                    for (let result of results) {
+                        if (result.error) {
+                            console.error(`Error for node ${result.node_id}:`, result.error);
+                        }
+                        
+                        // Find the node data to get coordinates
+                        const nodeData = selectedNodes.find(n => n.id === result.node_id);
+                        
                         massResultsData.push({
-                            node_id: node.id,
-                            node_lat: node.lat,
-                            node_lng: node.lng,
-                            with_area: result.with_park.area_km2,
-                            without_area: result.without_park.area_km2,
-                            with_street_length: result.enhanced_metrics.with_street_length_km,
-                            without_street_length: result.enhanced_metrics.without_street_length_km,
-                            difference: result.difference_km2,
-                            street_network_difference: result.street_network_difference_km,
-                            area_change_pct: result.area_change_pct,
-                            street_network_change_pct: result.street_network_change_pct,
-                            with_nodes: result.with_park.reachable_nodes,
-                            without_nodes: result.without_park.reachable_nodes,
-                            node_difference: result.node_difference,
-                            with_edges: result.with_park.street_network_stats.edge_count,
-                            without_edges: result.without_park.street_network_stats.edge_count,
-                            edge_difference: result.edge_difference,
-                            impact_category: result.impact_category,
-                            impact_label: result.impact_label,
-                            connectivity_with: result.enhanced_metrics.with_connectivity,
-                            connectivity_without: result.enhanced_metrics.without_connectivity,
-                            connectivity_change: result.enhanced_metrics.connectivity_change,
-                            distance_with: result.enhanced_metrics.with_avg_distance,
-                            distance_without: result.enhanced_metrics.without_avg_distance,
-                            street_density_with: result.enhanced_metrics.with_street_density,
-                            street_density_without: result.enhanced_metrics.without_street_density
+                            node_id: result.node_id,
+                            node_lat: nodeData ? nodeData.lat : 0,
+                            node_lng: nodeData ? nodeData.lng : 0,
+                            with_area: result.with_park?.area_km2 || 0,
+                            without_area: result.without_park?.area_km2 || 0,
+                            with_street_length: result.enhanced_metrics?.with_street_length_km || 0,
+                            without_street_length: result.enhanced_metrics?.without_street_length_km || 0,
+                            difference: result.difference_km2 || 0,
+                            street_network_difference: result.street_network_difference_km || 0,
+                            area_change_pct: result.area_change_pct || 0,
+                            street_network_change_pct: result.street_network_change_pct || 0,
+                            with_nodes: result.with_park?.reachable_nodes || 0,
+                            without_nodes: result.without_park?.reachable_nodes || 0,
+                            node_difference: result.node_difference || 0,
+                            with_edges: result.with_park?.street_network_stats?.edge_count || 0,
+                            without_edges: result.without_park?.street_network_stats?.edge_count || 0,
+                            edge_difference: result.edge_difference || 0,
+                            impact_category: result.impact_category || 'neutral',
+                            impact_label: result.impact_label || 'Neutral',
+                            connectivity_with: result.enhanced_metrics?.with_connectivity || 0,
+                            connectivity_without: result.enhanced_metrics?.without_connectivity || 0,
+                            connectivity_change: result.enhanced_metrics?.connectivity_change || 0,
+                            distance_with: result.enhanced_metrics?.with_avg_distance || 0,
+                            distance_without: result.enhanced_metrics?.without_avg_distance || 0,
+                            street_density_with: result.enhanced_metrics?.with_street_density || 0,
+                            street_density_without: result.enhanced_metrics?.without_street_density || 0
                         });
                     }
-                } catch (error) {
-                    console.error('Error analyzing node', node.id, ':', error);
+                } else {
+                    throw new Error(`Batch analysis failed: ${results.detail || 'Unknown error'}`);
                 }
+            } catch (error) {
+                console.error('Error in mass analysis:', error);
+                alert(`Mass analysis failed: ${error.message}`);
             }
 
-            // Hide progress and show results
-            document.getElementById('massProgress').style.display = 'none';
+            // Complete progress and hide
+            document.getElementById('massProgressBar').style.width = '100%';
+            document.getElementById('massProgressText').textContent = `Completed analysis of ${massResultsData.length} nodes`;
+            
+            setTimeout(() => {
+                document.getElementById('massProgress').style.display = 'none';
+            }, 1000);
+            
             document.getElementById('massAnalyzeBtn').disabled = false;
             
             displayMassResults();
@@ -2531,6 +3224,31 @@ async def load_data(lat: float, lng: float, radius: int = 2000):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/progress")
+async def get_progress(lat: float, lng: float, radius: int = 2000):
+    """Get loading progress for a specific area"""
+    progress_key = f"{lat:.4f}_{lng:.4f}_{radius}"
+    progress = LOADING_PROGRESS.get(progress_key, {
+        'current_step': 0,
+        'total_steps': 9,
+        'step_name': 'Waiting to start...',
+        'completed': False
+    })
+    return progress
+
+@app.get("/mass-progress")
+async def get_mass_progress(progress_key: str):
+    """Get mass analysis progress for a specific batch"""
+    progress = MASS_ANALYSIS_PROGRESS.get(progress_key, {
+        'total_nodes': 0,
+        'completed_nodes': 0,
+        'current_node': 'Not found',
+        'completed': True
+    })
+    
+    # Include results if available
+    return progress
+
 @app.post("/analyze")
 async def analyze_accessibility(request: dict):
     """Analyze park accessibility impact"""
@@ -2543,11 +3261,50 @@ async def analyze_accessibility(request: dict):
         walk_time = request.get('walk_time', 10.0)  # Default 10 minutes
         walk_speed = request.get('walk_speed', 4.5)  # Default 4.5 km/h
         viz_method = request.get('viz_method', 'convex_hull')  # Default convex hull
+        network_backend = request.get('network_backend', 'networkit')  # Default NetworkX
         
         result = await analyzer.calculate_accessibility(
-            lat, lng, radius, park_id, node_id, walk_time, walk_speed, viz_method
+            lat, lng, radius, park_id, node_id, walk_time, walk_speed, viz_method, network_backend
         )
         return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/mass-analyze")
+async def mass_analyze_accessibility(request: dict):
+    """Start batch analysis and return progress key immediately"""
+    try:
+        lat = request['lat']
+        lng = request['lng'] 
+        radius = request['radius']
+        park_id = request['park_id']
+        node_ids = request['node_ids']  # Array of node IDs
+        walk_time = request.get('walk_time', 10.0)
+        walk_speed = request.get('walk_speed', 4.5)
+        viz_method = request.get('viz_method', 'convex_hull')
+        network_backend = request.get('network_backend', 'networkit')
+        
+        # Generate progress key immediately
+        import time
+        progress_key = f"mass_{park_id}_{int(time.time())}"
+        
+        # Initialize progress tracking
+        MASS_ANALYSIS_PROGRESS[progress_key] = {
+            'total_nodes': len(node_ids),
+            'completed_nodes': 0,
+            'current_node': None,
+            'completed': False,
+            'start_time': time.time(),
+            'results': None
+        }
+        
+        # Start batch processing in background (non-blocking)
+        asyncio.create_task(analyzer.calculate_mass_accessibility_background(
+            lat, lng, radius, park_id, node_ids, walk_time, walk_speed, viz_method, network_backend, progress_key
+        ))
+        
+        # Return progress key immediately
+        return {"progress_key": progress_key}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
