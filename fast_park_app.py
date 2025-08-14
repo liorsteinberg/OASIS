@@ -301,7 +301,7 @@ class ParkAccessibilityAnalyzer:
         # Create unique progress key for this request
         progress_key = f"{lat:.4f}_{lng:.4f}_{radius}"
         
-        total_steps = 9
+        total_steps = 14
         current_step = 0
         
         def log_progress(step_name: str):
@@ -321,7 +321,9 @@ class ParkAccessibilityAnalyzer:
             log_progress("Loading parks from OpenStreetMap...")
             tags = {"leisure": ["park", "recreation_ground"], "landuse": ["grass", "recreation_ground"]}
             parks = ox.features_from_point((lat, lng), tags=tags, dist=radius)
-            print(f"Raw parks loaded: {len(parks)}")
+            # Ensure WGS84 CRS for consistency
+            parks = parks.to_crs('EPSG:4326')
+            print(f"Raw parks loaded: {len(parks)} (CRS: {parks.crs})")
             
             # Step 2: Filter and process park geometries
             log_progress("Filtering park geometries...")
@@ -380,7 +382,10 @@ class ParkAccessibilityAnalyzer:
             # Step 6: Create geographic data frames
             log_progress("Creating geographic data frames...")
             nodes_gdf, edges_gdf = ox.graph_to_gdfs(graph)
-            print(f"GDFs created: {len(nodes_gdf)} nodes, {len(edges_gdf)} edges")
+            # Ensure consistent CRS for all geodataframes
+            nodes_gdf = nodes_gdf.to_crs('EPSG:4326')
+            edges_gdf = edges_gdf.to_crs('EPSG:4326')
+            print(f"GDFs created: {len(nodes_gdf)} nodes, {len(edges_gdf)} edges (CRS: {nodes_gdf.crs})")
             
             # Step 7: Process parks for visualization
             log_progress("Processing parks for web display...")
@@ -432,6 +437,91 @@ class ParkAccessibilityAnalyzer:
             
             print(f"Data preparation complete: {len(parks_data)} parks, {len(nodes_data)} nodes")
             
+            # Step 9: Load supermarkets from OpenStreetMap
+            # Use larger radius for amenities to capture walkable POIs beyond park area
+            poi_radius = radius * 2  # Double the radius for POI search
+            log_progress("Loading supermarkets from OpenStreetMap...")
+            try:
+                supermarkets_gdf = ox.features_from_point(
+                    (lat, lng), 
+                    dist=poi_radius,
+                    tags={'shop': ['supermarket', 'grocery', 'convenience', 'department_store', 'general', 'food'], 'amenity': ['marketplace', 'food_court']}
+                )
+                if not supermarkets_gdf.empty:
+                    # Ensure WGS84 CRS for consistency
+                    supermarkets_gdf = supermarkets_gdf.to_crs('EPSG:4326')
+                print(f"Loaded {len(supermarkets_gdf) if not supermarkets_gdf.empty else 0} supermarkets (CRS: {supermarkets_gdf.crs if not supermarkets_gdf.empty else 'N/A'})")
+            except Exception as e:
+                print(f"Failed to load supermarkets: {e}")
+                import geopandas as gpd
+                supermarkets_gdf = gpd.GeoDataFrame()
+            
+            # Step 10: Load schools from OpenStreetMap
+            log_progress("Loading schools from OpenStreetMap...")
+            try:
+                schools_gdf = ox.features_from_point((lat, lng), dist=poi_radius, tags={'amenity': 'school'})
+                if not schools_gdf.empty:
+                    schools_gdf = schools_gdf.to_crs('EPSG:4326')
+                print(f"Loaded {len(schools_gdf) if not schools_gdf.empty else 0} schools (CRS: {schools_gdf.crs if not schools_gdf.empty else 'N/A'})")
+            except Exception as e:
+                print(f"Failed to load schools: {e}")
+                import geopandas as gpd
+                schools_gdf = gpd.GeoDataFrame()
+            
+            # Step 11: Load playgrounds from OpenStreetMap
+            log_progress("Loading playgrounds from OpenStreetMap...")
+            try:
+                playgrounds_gdf = ox.features_from_point((lat, lng), dist=poi_radius, tags={'leisure': 'playground'})
+                if not playgrounds_gdf.empty:
+                    playgrounds_gdf = playgrounds_gdf.to_crs('EPSG:4326')
+                print(f"Loaded {len(playgrounds_gdf) if not playgrounds_gdf.empty else 0} playgrounds (CRS: {playgrounds_gdf.crs if not playgrounds_gdf.empty else 'N/A'})")
+            except Exception as e:
+                print(f"Failed to load playgrounds: {e}")
+                import geopandas as gpd
+                playgrounds_gdf = gpd.GeoDataFrame()
+            
+            # Step 12: Load cafes/bars from OpenStreetMap
+            log_progress("Loading cafes and bars from OpenStreetMap...")
+            try:
+                cafes_bars_gdf = ox.features_from_point(
+                    (lat, lng), 
+                    dist=poi_radius, 
+                    tags={'amenity': ['cafe', 'bar', 'pub', 'restaurant'], 'shop': ['coffee']}
+                )
+                if not cafes_bars_gdf.empty:
+                    cafes_bars_gdf = cafes_bars_gdf.to_crs('EPSG:4326')
+                print(f"Loaded {len(cafes_bars_gdf) if not cafes_bars_gdf.empty else 0} cafes/bars (CRS: {cafes_bars_gdf.crs if not cafes_bars_gdf.empty else 'N/A'})")
+            except Exception as e:
+                print(f"Failed to load cafes/bars: {e}")
+                import geopandas as gpd
+                cafes_bars_gdf = gpd.GeoDataFrame()
+            
+            # Step 13: Load public transit from OpenStreetMap
+            log_progress("Loading public transit stops from OpenStreetMap...")
+            try:
+                transit_gdf = ox.features_from_point(
+                    (lat, lng), 
+                    dist=poi_radius, 
+                    tags={'public_transport': ['station', 'stop_position', 'platform'], 'railway': ['station', 'halt', 'tram_stop'], 'highway': 'bus_stop'}
+                )
+                if not transit_gdf.empty:
+                    transit_gdf = transit_gdf.to_crs('EPSG:4326')
+                print(f"Loaded {len(transit_gdf) if not transit_gdf.empty else 0} transit stops (CRS: {transit_gdf.crs if not transit_gdf.empty else 'N/A'})")
+            except Exception as e:
+                print(f"Failed to load transit stops: {e}")
+                import geopandas as gpd
+                transit_gdf = gpd.GeoDataFrame()
+            
+            print(f"Amenities loaded (radius {poi_radius}m): {len(supermarkets_gdf)} supermarkets, {len(schools_gdf)} schools, {len(playgrounds_gdf)} playgrounds, {len(cafes_bars_gdf)} cafes/bars, {len(transit_gdf)} transit stops")
+            
+            # Debug: Show first few entries of each amenity type if available
+            if len(supermarkets_gdf) > 0:
+                print(f"Sample supermarket: {supermarkets_gdf.iloc[0].get('name', 'Unnamed')} at ({supermarkets_gdf.iloc[0].geometry.centroid.y:.6f}, {supermarkets_gdf.iloc[0].geometry.centroid.x:.6f})")
+            if len(schools_gdf) > 0:
+                print(f"Sample school: {schools_gdf.iloc[0].get('name', 'Unnamed')} at ({schools_gdf.iloc[0].geometry.centroid.y:.6f}, {schools_gdf.iloc[0].geometry.centroid.x:.6f})")
+            if len(transit_gdf) > 0:
+                print(f"Sample transit: {transit_gdf.iloc[0].get('name', 'Unnamed')} at ({transit_gdf.iloc[0].geometry.centroid.y:.6f}, {transit_gdf.iloc[0].geometry.centroid.x:.6f})")
+            
             # Mark progress as completed
             LOADING_PROGRESS[progress_key] = {
                 'current_step': total_steps,
@@ -458,7 +548,12 @@ class ParkAccessibilityAnalyzer:
                 'parks_gdf': parks,
                 'nodes_gdf': nodes_gdf,
                 'edges_gdf': edges_gdf,
-                'center': [lat, lng]
+                'center': [lat, lng],
+                'supermarkets_gdf': supermarkets_gdf,
+                'schools_gdf': schools_gdf,
+                'playgrounds_gdf': playgrounds_gdf,
+                'cafes_bars_gdf': cafes_bars_gdf,
+                'transit_gdf': transit_gdf
             }
             
         except Exception as e:
@@ -619,11 +714,23 @@ class ParkAccessibilityAnalyzer:
                     
                     # Calculate WITH park using shared adapter
                     with_park = self._calculate_isochrone(with_park_adapter, nodes_gdf, data['edges_gdf'], 
-                                                        node_key, max_distance, viz_method)
+                                                        node_key, max_distance, viz_method,
+                                                        supermarkets_gdf=data.get('supermarkets_gdf'),
+                                                        schools_gdf=data.get('schools_gdf'),
+                                                        playgrounds_gdf=data.get('playgrounds_gdf'),
+                                                        cafes_bars_gdf=data.get('cafes_bars_gdf'),
+                                                        transit_gdf=data.get('transit_gdf'),
+                                                        debug_label="WITH_PARK")
                     
                     # Calculate WITHOUT park using shared adapter 
                     without_park = self._calculate_isochrone(without_park_adapter, nodes_gdf, data['edges_gdf'],
-                                                           node_key, max_distance, viz_method)
+                                                           node_key, max_distance, viz_method,
+                                                           supermarkets_gdf=data.get('supermarkets_gdf'),
+                                                           schools_gdf=data.get('schools_gdf'),
+                                                           playgrounds_gdf=data.get('playgrounds_gdf'),
+                                                           cafes_bars_gdf=data.get('cafes_bars_gdf'),
+                                                           transit_gdf=data.get('transit_gdf'),
+                                                           debug_label="WITHOUT_PARK")
                     
                     # Calculate metrics (same as single node analysis)
                     area_difference = without_park['area_km2'] - with_park['area_km2']
@@ -674,7 +781,17 @@ class ParkAccessibilityAnalyzer:
                             'with_street_length_km': with_park['street_network_stats']['total_length_km'],
                             'without_street_length_km': without_park['street_network_stats']['total_length_km'],
                             'with_street_density': with_park['street_network_stats']['street_density_km_per_km2'],
-                            'without_street_density': without_park['street_network_stats']['street_density_km_per_km2']
+                            'without_street_density': without_park['street_network_stats']['street_density_km_per_km2'],
+                            'with_supermarkets_accessible': with_park.get('accessible_supermarkets', 0),
+                            'without_supermarkets_accessible': without_park.get('accessible_supermarkets', 0),
+                            'with_schools_accessible': with_park.get('accessible_schools', 0),
+                            'without_schools_accessible': without_park.get('accessible_schools', 0),
+                            'with_playgrounds_accessible': with_park.get('accessible_playgrounds', 0),
+                            'without_playgrounds_accessible': without_park.get('accessible_playgrounds', 0),
+                            'with_cafes_bars_accessible': with_park.get('accessible_cafes_bars', 0),
+                            'without_cafes_bars_accessible': without_park.get('accessible_cafes_bars', 0),
+                            'with_transit_accessible': with_park.get('accessible_transit', 0),
+                            'without_transit_accessible': without_park.get('accessible_transit', 0)
                         }
                     }
                 except Exception as e:
@@ -789,13 +906,23 @@ class ParkAccessibilityAnalyzer:
             network_adapter = create_network_adapter(graph, network_backend)
             
             # Calculate WITH park
-            with_park = self._calculate_isochrone(network_adapter, nodes_gdf, data['edges_gdf'], node_key, max_distance, viz_method)
+            with_park = self._calculate_isochrone(network_adapter, nodes_gdf, data['edges_gdf'], node_key, max_distance, viz_method,
+                                                supermarkets_gdf=data.get('supermarkets_gdf'),
+                                                schools_gdf=data.get('schools_gdf'),
+                                                playgrounds_gdf=data.get('playgrounds_gdf'),
+                                                cafes_bars_gdf=data.get('cafes_bars_gdf'),
+                                                transit_gdf=data.get('transit_gdf'))
             
             print("Calculating WITHOUT park...")
             # Calculate WITHOUT park - remove park edges and create new adapter
             edges_to_remove = self._get_park_edges(graph, nodes_gdf, park_geom)
             filtered_adapter = network_adapter.remove_edges(edges_to_remove)
-            without_park = self._calculate_isochrone(filtered_adapter, nodes_gdf, data['edges_gdf'], node_key, max_distance, viz_method)
+            without_park = self._calculate_isochrone(filtered_adapter, nodes_gdf, data['edges_gdf'], node_key, max_distance, viz_method,
+                                                   supermarkets_gdf=data.get('supermarkets_gdf'),
+                                                   schools_gdf=data.get('schools_gdf'),
+                                                   playgrounds_gdf=data.get('playgrounds_gdf'),
+                                                   cafes_bars_gdf=data.get('cafes_bars_gdf'),
+                                                   transit_gdf=data.get('transit_gdf'))
             
             print("Accessibility calculation complete")
             
@@ -848,7 +975,17 @@ class ParkAccessibilityAnalyzer:
                     'with_street_length_km': with_park['street_network_stats']['total_length_km'],
                     'without_street_length_km': without_park['street_network_stats']['total_length_km'],
                     'with_street_density': with_park['street_network_stats']['street_density_km_per_km2'],
-                    'without_street_density': without_park['street_network_stats']['street_density_km_per_km2']
+                    'without_street_density': without_park['street_network_stats']['street_density_km_per_km2'],
+                    'with_supermarkets_accessible': with_park.get('accessible_supermarkets', 0),
+                    'without_supermarkets_accessible': without_park.get('accessible_supermarkets', 0),
+                    'with_schools_accessible': with_park.get('accessible_schools', 0),
+                    'without_schools_accessible': without_park.get('accessible_schools', 0),
+                    'with_playgrounds_accessible': with_park.get('accessible_playgrounds', 0),
+                    'without_playgrounds_accessible': without_park.get('accessible_playgrounds', 0),
+                    'with_cafes_bars_accessible': with_park.get('accessible_cafes_bars', 0),
+                    'without_cafes_bars_accessible': without_park.get('accessible_cafes_bars', 0),
+                    'with_transit_accessible': with_park.get('accessible_transit', 0),
+                    'without_transit_accessible': without_park.get('accessible_transit', 0)
                 }
             }
             
@@ -860,7 +997,9 @@ class ParkAccessibilityAnalyzer:
     
     def _calculate_isochrone(self, network_adapter: NetworkAdapter, nodes_gdf: gpd.GeoDataFrame, 
                            edges_gdf: gpd.GeoDataFrame, start_node: int, max_distance: float, 
-                           viz_method: str = "convex_hull", park_geometry=None) -> Dict:
+                           viz_method: str = "convex_hull", park_geometry=None, 
+                           supermarkets_gdf=None, schools_gdf=None, playgrounds_gdf=None, 
+                           cafes_bars_gdf=None, transit_gdf=None, debug_label="") -> Dict:
         """Calculate isochrone for a node with enhanced metrics"""
         if start_node not in network_adapter.nx_graph:
             print(f"Start node {start_node} not found in graph")
@@ -930,6 +1069,16 @@ class ParkAccessibilityAnalyzer:
             # Calculate reachable street network metrics
             street_network_stats = self._calculate_street_network_stats(network_adapter.nx_graph, edges_gdf, reachable_nodes, area_result['area_km2'])
             
+            # Calculate accessible amenities within the isochrone using pre-loaded data
+            print(f"{debug_label} Isochrone calculation - Received amenity data: supermarkets={len(supermarkets_gdf) if supermarkets_gdf is not None else 0} (empty={supermarkets_gdf.empty if supermarkets_gdf is not None else 'N/A'}), schools={len(schools_gdf) if schools_gdf is not None else 0} (empty={schools_gdf.empty if schools_gdf is not None else 'N/A'}), playgrounds={len(playgrounds_gdf) if playgrounds_gdf is not None else 0} (empty={playgrounds_gdf.empty if playgrounds_gdf is not None else 'N/A'}), cafes_bars={len(cafes_bars_gdf) if cafes_bars_gdf is not None else 0} (empty={cafes_bars_gdf.empty if cafes_bars_gdf is not None else 'N/A'}), transit={len(transit_gdf) if transit_gdf is not None else 0} (empty={transit_gdf.empty if transit_gdf is not None else 'N/A'})")
+            
+            # Use proper null checking to avoid GeoDataFrame boolean ambiguity
+            accessible_supermarkets = self._calculate_accessible_supermarkets(area_result, points, supermarkets_gdf if supermarkets_gdf is not None and not supermarkets_gdf.empty else None, debug_label)
+            accessible_schools = self._calculate_accessible_schools(area_result, points, schools_gdf if schools_gdf is not None and not schools_gdf.empty else None, debug_label)
+            accessible_playgrounds = self._calculate_accessible_playgrounds(area_result, points, playgrounds_gdf if playgrounds_gdf is not None and not playgrounds_gdf.empty else None, debug_label)
+            accessible_cafes_bars = self._calculate_accessible_cafes_bars(area_result, points, cafes_bars_gdf if cafes_bars_gdf is not None and not cafes_bars_gdf.empty else None, debug_label)
+            accessible_transit = self._calculate_accessible_transit(area_result, points, transit_gdf if transit_gdf is not None and not transit_gdf.empty else None, debug_label)
+            
             # Compile enhanced result
             result = {
                 **area_result,
@@ -937,7 +1086,12 @@ class ParkAccessibilityAnalyzer:
                 'connectivity_stats': connectivity_stats,
                 'street_network_stats': street_network_stats,
                 'node_coordinates': node_coords,
-                'reachable_distances': dict(zip(reachable_nodes, distances))
+                'reachable_distances': dict(zip(reachable_nodes, distances)),
+                'accessible_supermarkets': accessible_supermarkets,
+                'accessible_schools': accessible_schools,
+                'accessible_playgrounds': accessible_playgrounds,
+                'accessible_cafes_bars': accessible_cafes_bars,
+                'accessible_transit': accessible_transit
             }
             
             return result
@@ -963,7 +1117,12 @@ class ParkAccessibilityAnalyzer:
                 'total_length_km': 0, 'edge_count': 0, 'street_density_km_per_km2': 0, 'avg_edge_length_m': 0
             },
             'node_coordinates': {},
-            'reachable_distances': {}
+            'reachable_distances': {},
+            'accessible_supermarkets': 0,
+            'accessible_schools': 0,
+            'accessible_playgrounds': 0,
+            'accessible_cafes_bars': 0,
+            'accessible_transit': 0
         }
     
     def _calculate_street_network_stats(self, graph: nx.Graph, edges_gdf: gpd.GeoDataFrame, 
@@ -1009,6 +1168,110 @@ class ParkAccessibilityAnalyzer:
             return {
                 'total_length_km': 0, 'edge_count': 0, 'street_density_km_per_km2': 0, 'avg_edge_length_m': 0
             }
+    
+    def _calculate_accessible_supermarkets(self, area_result, points, supermarkets_gdf, debug_label=""):
+        """Calculate number of supermarkets accessible within the isochrone area using pre-loaded data"""
+        return self._filter_amenities_in_polygon(area_result, points, supermarkets_gdf, "Supermarkets", debug_label)
+    
+    def _filter_amenities_in_polygon(self, area_result, points, amenities_gdf, amenity_name, debug_label=""):
+        """Generic method to filter amenities within the isochrone polygon"""
+        try:
+            print(f"{debug_label} {amenity_name} Filter Debug - Input: {len(points)} points")
+            print(f"{debug_label} {amenity_name} Filter Debug - amenities_gdf type: {type(amenities_gdf)}")
+            print(f"{debug_label} {amenity_name} Filter Debug - amenities_gdf is None: {amenities_gdf is None}")
+            if amenities_gdf is not None:
+                print(f"{debug_label} {amenity_name} Filter Debug - amenities_gdf length: {len(amenities_gdf)}")
+                print(f"{debug_label} {amenity_name} Filter Debug - amenities_gdf empty: {amenities_gdf.empty}")
+            
+            if len(points) < 3:
+                print(f"{amenity_name} Filter Debug - Too few points ({len(points)})")
+                return 0
+                
+            # Check if amenities data is available
+            if amenities_gdf is None:
+                print(f"{amenity_name} Filter Debug - amenities_gdf is None, returning 0")
+                return 0
+            
+            if hasattr(amenities_gdf, 'empty') and amenities_gdf.empty:
+                print(f"{amenity_name} Filter Debug - amenities_gdf is empty, returning 0")
+                return 0
+            
+            # Create a polygon from the boundary points
+            from shapely.geometry import Polygon, Point
+            
+            # Convert boundary to lng/lat coordinates for proper Shapely polygon
+            if 'boundary' in area_result and len(area_result['boundary']) > 3:
+                print(f"{amenity_name} Filter Debug - Using boundary points: {len(area_result['boundary'])}")
+                # boundary coords are [lat, lng] format, convert to [lng, lat] for Shapely
+                boundary_coords = [(coord[1], coord[0]) for coord in area_result['boundary']]
+                polygon = Polygon(boundary_coords)
+                print(f"{amenity_name} Filter Debug - Boundary polygon bounds: {polygon.bounds}")
+            else:
+                print(f"{amenity_name} Filter Debug - Using convex hull from {len(points)} points")
+                # Fallback: create simple polygon from points
+                if len(points) >= 3:
+                    hull_points = []
+                    from scipy.spatial import ConvexHull
+                    hull = ConvexHull(points)
+                    for vertex in hull.vertices:
+                        # points are [lat, lng] format, convert to [lng, lat] for Shapely
+                        hull_points.append((points[vertex][1], points[vertex][0]))
+                    polygon = Polygon(hull_points)
+                    print(f"{amenity_name} Filter Debug - Hull polygon bounds: {polygon.bounds}")
+                else:
+                    return 0
+            
+            print(f"{amenity_name} Filter Debug - Processing {len(amenities_gdf)} pre-loaded {amenity_name.lower()}")
+            
+            # Filter amenities within the accessible area polygon
+            accessible_count = 0
+            sample_count = 0
+            for idx, amenity in amenities_gdf.iterrows():
+                try:
+                    if hasattr(amenity.geometry, 'centroid'):
+                        point = amenity.geometry.centroid
+                    else:
+                        point = amenity.geometry
+                    
+                    # Debug first few amenities
+                    if sample_count < 5:
+                        print(f"{amenity_name} Filter Debug - Sample amenity {sample_count}: Point({point.x}, {point.y})")
+                        sample_count += 1
+                    
+                    # Check if point is within the accessible area polygon
+                    amenity_point = Point(point.x, point.y)  # Point(lng, lat) to match polygon coordinate system
+                    if polygon.contains(amenity_point):
+                        accessible_count += 1
+                        if accessible_count <= 3:  # Debug first few matches
+                            name = amenity.get('name', f'Unnamed {amenity_name}')
+                            print(f"{amenity_name} Filter Debug - Match {accessible_count}: {name} at Point({point.x}, {point.y})")
+                except Exception as e:
+                    if sample_count < 5:
+                        print(f"{amenity_name} Filter Debug - Error processing amenity {sample_count}: {e}")
+                    continue
+            
+            print(f"{amenity_name} Filter Debug - Final accessible count: {accessible_count}")
+            return accessible_count
+                
+        except Exception as e:
+            print(f"Error calculating accessible {amenity_name.lower()}: {e}")
+            return 0
+
+    def _calculate_accessible_schools(self, area_result, points, schools_gdf, debug_label=""):
+        """Calculate number of schools accessible within the isochrone area using pre-loaded data"""
+        return self._filter_amenities_in_polygon(area_result, points, schools_gdf, "Schools", debug_label)
+    
+    def _calculate_accessible_playgrounds(self, area_result, points, playgrounds_gdf, debug_label=""):
+        """Calculate number of playgrounds accessible within the isochrone area using pre-loaded data"""
+        return self._filter_amenities_in_polygon(area_result, points, playgrounds_gdf, "Playgrounds", debug_label)
+    
+    def _calculate_accessible_cafes_bars(self, area_result, points, cafes_bars_gdf, debug_label=""):
+        """Calculate number of cafes/bars accessible within the isochrone area using pre-loaded data"""
+        return self._filter_amenities_in_polygon(area_result, points, cafes_bars_gdf, "Cafes/Bars", debug_label)
+    
+    def _calculate_accessible_transit(self, area_result, points, transit_gdf, debug_label=""):
+        """Calculate number of public transit stations accessible within the isochrone area using pre-loaded data"""
+        return self._filter_amenities_in_polygon(area_result, points, transit_gdf, "Transit", debug_label)
     
     def _create_convex_hull_isochrone(self, points_array: np.ndarray, reachable_nodes: list) -> Dict:
         """Create convex hull isochrone (fast but can overlap parks)"""
@@ -1303,6 +1566,93 @@ async def read_index():
             margin-top: 0;
             color: #007bff;
         }
+        .tab-navigation {
+            display: flex;
+            border-bottom: 2px solid #e9ecef;
+            margin-bottom: 20px;
+        }
+        .tab-btn {
+            flex: 1;
+            padding: 12px 20px;
+            border: none;
+            background-color: #f8f9fa;
+            color: #6c757d;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            border-radius: 8px 8px 0 0;
+            margin-right: 4px;
+            transition: all 0.3s ease;
+        }
+        .tab-btn:hover {
+            background-color: #e9ecef;
+            color: #495057;
+        }
+        .tab-btn.active {
+            background-color: #007bff;
+            color: white;
+            border-bottom: 2px solid #007bff;
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+        }
+        .comparison-table-container {
+            margin: 20px 0;
+        }
+        .comparison-table {
+            width: 100%;
+            border-collapse: collapse;
+            background-color: white;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .comparison-table th {
+            background-color: #007bff;
+            color: white;
+            padding: 12px;
+            text-align: center;
+            font-weight: 600;
+        }
+        .comparison-table th:first-child {
+            background-color: #495057;
+            text-align: left;
+        }
+        .comparison-table td {
+            padding: 12px;
+            border-bottom: 1px solid #e9ecef;
+        }
+        .comparison-table td:first-child {
+            background-color: #f8f9fa;
+            font-weight: 500;
+            color: #495057;
+        }
+        .comparison-table td:not(:first-child) {
+            text-align: center;
+            font-weight: 600;
+            font-size: 16px;
+        }
+        .comparison-table tr:last-child td {
+            border-bottom: none;
+        }
+        .comparison-table .metric-unit {
+            font-size: 14px;
+            color: #6c757d;
+            font-weight: normal;
+        }
+        .comparison-table .impact-row td:not(:first-child) {
+            font-size: 14px;
+        }
+        .comparison-table .difference-row {
+            background-color: #f1f3f4;
+        }
+        .comparison-table .difference-row td:first-child {
+            background-color: #e9ecef;
+            font-weight: 600;
+        }
         .center-marker {
             background: none;
             border: none;
@@ -1314,6 +1664,53 @@ async def read_index():
         .impact-neutral { color: #6c757d; }
         .impact-negative { color: #dc3545; }
         .impact-highly-negative { color: #a71d2a; font-weight: bold; }
+        
+        /* Significance level styling */
+        .significance-no-change { color: #6c757d; }
+        .significance-minimal { color: #ffc107; }
+        .significance-notable { color: #17a2b8; }
+        .significance-strong { color: #28a745; }
+        .significance-high { color: #20c997; font-weight: bold; }
+        .significance-transformative { color: #198754; font-weight: bold; }
+        
+        /* Tooltip styling */
+        .tooltip {
+            position: relative;
+            display: inline-block;
+            cursor: help;
+        }
+        .tooltip .tooltiptext {
+            visibility: hidden;
+            width: 300px;
+            background-color: #333;
+            color: #fff;
+            text-align: left;
+            border-radius: 6px;
+            padding: 10px;
+            position: absolute;
+            z-index: 1000;
+            bottom: 125%;
+            left: 50%;
+            margin-left: -150px;
+            opacity: 0;
+            transition: opacity 0.3s;
+            font-size: 12px;
+            line-height: 1.4;
+        }
+        .tooltip .tooltiptext::after {
+            content: "";
+            position: absolute;
+            top: 100%;
+            left: 50%;
+            margin-left: -5px;
+            border-width: 5px;
+            border-style: solid;
+            border-color: #333 transparent transparent transparent;
+        }
+        .tooltip:hover .tooltiptext {
+            visibility: visible;
+            opacity: 1;
+        }
         .chart-container {
             position: relative;
             height: 300px;
@@ -1493,24 +1890,62 @@ async def read_index():
         </div>
 
         <div class="step">
-            <h3>Step 4: Single Node Analysis</h3>
-            <p>Run accessibility analysis for the selected park and node to see the impact.</p>
-            <div class="controls">
-                <div class="control-group">
-                    <label>&nbsp;</label>
-                    <button class="btn" onclick="runAnalysis()" disabled id="analyzeBtn">🔍 Run Single Analysis</button>
+            <h3>Step 4: Analysis Mode</h3>
+            <p>Choose your analysis approach and configure settings.</p>
+            
+            <!-- Tab Navigation -->
+            <div class="tab-navigation">
+                <button class="tab-btn active" onclick="switchTab('single')" id="singleTab">🎯 Single Node Analysis</button>
+                <button class="tab-btn" onclick="switchTab('mass')" id="massTab">📊 Mass Analysis</button>
+            </div>
+            
+            <!-- Single Node Analysis Tab -->
+            <div id="singleAnalysisTab" class="tab-content active">
+                <p>Run accessibility analysis for the selected park and node to see the impact.</p>
+                <div class="controls">
+                    <div class="control-group">
+                        <label>&nbsp;</label>
+                        <button class="btn" onclick="runAnalysis()" disabled id="analyzeBtn">🔍 Run Single Analysis</button>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Mass Analysis Tab -->
+            <div id="massAnalysisTab" class="tab-content">
+                <p>Analyze multiple nodes around the selected park to get comprehensive statistics about the park's accessibility impact.</p>
+                <div class="controls">
+                    <div class="control-group">
+                        <label for="massNodeCount">Number of nodes to analyze:</label>
+                        <select id="massNodeCount">
+                            <option value="5">5 nodes (Quick)</option>
+                            <option value="10" selected>10 nodes (Balanced)</option>
+                            <option value="20">20 nodes (Comprehensive)</option>
+                            <option value="30">30 nodes (Detailed)</option>
+                        </select>
+                    </div>
+                    <div class="control-group">
+                        <label for="massRadius">Node search radius (m):</label>
+                        <input type="range" id="massRadius" min="400" max="1200" value="600" step="100" oninput="updateMassRadius()">
+                        <span id="massRadiusValue">600m</span>
+                    </div>
+                    <div class="control-group">
+                        <label>&nbsp;</label>
+                        <button class="btn" onclick="runMassAnalysis()" disabled id="massAnalyzeBtn" style="background-color: #28a745;">🔍 Mass Analysis</button>
+                    </div>
+                </div>
+                <div id="massProgress" style="display: none;">
+                    <div style="background-color: #e9ecef; border-radius: 10px; padding: 3px; margin: 10px 0;">
+                        <div id="massProgressBar" style="background-color: #28a745; height: 20px; border-radius: 7px; width: 0%; transition: width 0.3s;"></div>
+                    </div>
+                    <div id="massProgressText">Analyzing node 0/10...</div>
                 </div>
             </div>
         </div>
 
+        <!-- Single Node Results -->
         <div id="results" class="results">
             <h3>📊 Single Node Results</h3>
-            <div id="metrics" class="metrics"></div>
-            
-            <div class="step">
-                <h4>🔍 Enhanced Metrics</h4>
-                <div id="enhancedMetrics" class="enhanced-metrics"></div>
-            </div>
+            <div id="metrics" class="comparison-table-container"></div>
             
             <div class="step">
                 <h4>📈 Visual Analysis</h4>
@@ -1522,37 +1957,6 @@ async def read_index():
                         <canvas id="detailedMetricsChart"></canvas>
                     </div>
                 </div>
-            </div>
-        </div>
-
-        <div class="step">
-            <h3>Step 5: Mass Analysis (Optional)</h3>
-            <p>Analyze multiple nodes around the selected park to get comprehensive statistics about the park's accessibility impact.</p>
-            <div class="controls">
-                <div class="control-group">
-                    <label for="massNodeCount">Number of nodes to analyze:</label>
-                    <select id="massNodeCount">
-                        <option value="5">5 nodes (Quick)</option>
-                        <option value="10" selected>10 nodes (Balanced)</option>
-                        <option value="20">20 nodes (Comprehensive)</option>
-                        <option value="30">30 nodes (Detailed)</option>
-                    </select>
-                </div>
-                <div class="control-group">
-                    <label for="massRadius">Node search radius (m):</label>
-                    <input type="range" id="massRadius" min="400" max="1200" value="600" step="100" oninput="updateMassRadius()">
-                    <span id="massRadiusValue">600m</span>
-                </div>
-                <div class="control-group">
-                    <label>&nbsp;</label>
-                    <button class="btn" onclick="runMassAnalysis()" disabled id="massAnalyzeBtn" style="background-color: #28a745;">🔍 Mass Analysis</button>
-                </div>
-            </div>
-            <div id="massProgress" style="display: none;">
-                <div style="background-color: #e9ecef; border-radius: 10px; padding: 3px; margin: 10px 0;">
-                    <div id="massProgressBar" style="background-color: #28a745; height: 20px; border-radius: 7px; width: 0%; transition: width 0.3s;"></div>
-                </div>
-                <div id="massProgressText">Analyzing node 0/10...</div>
             </div>
         </div>
 
@@ -1607,17 +2011,20 @@ async def read_index():
         let map;
         let parksData = [];
         let nodesData = [];
+        let poisData = [];
         let layerGroups = {
             parks: [],
             nodes: [],
             withPark: null,
-            withoutPark: null
+            withoutPark: null,
+            pois: []
         };
         let layerVisibility = {
             parks: true,
             nodes: true,
             withPark: true,
-            withoutPark: true
+            withoutPark: true,
+            pois: false
         };
         let centerMarker = null;
 
@@ -1861,6 +2268,29 @@ async def read_index():
             document.getElementById('massRadiusValue').textContent = `${radius}m`;
         }
 
+        function switchTab(tabName) {
+            // Hide all tab contents
+            document.getElementById('singleAnalysisTab').classList.remove('active');
+            document.getElementById('massAnalysisTab').classList.remove('active');
+            
+            // Remove active class from all tab buttons
+            document.getElementById('singleTab').classList.remove('active');
+            document.getElementById('massTab').classList.remove('active');
+            
+            // Show selected tab content and activate button
+            if (tabName === 'single') {
+                document.getElementById('singleAnalysisTab').classList.add('active');
+                document.getElementById('singleTab').classList.add('active');
+                // Hide mass results when switching to single tab
+                document.getElementById('massResults').style.display = 'none';
+            } else if (tabName === 'mass') {
+                document.getElementById('massAnalysisTab').classList.add('active');
+                document.getElementById('massTab').classList.add('active');
+                // Hide single results when switching to mass tab
+                document.getElementById('results').style.display = 'none';
+            }
+        }
+
         function updateLayerControls() {
             const container = document.getElementById('layerCheckboxes');
             const layerConfigs = [];
@@ -1897,6 +2327,15 @@ async def read_index():
                     key: 'withoutPark',
                     name: 'WITHOUT Park Area', 
                     color: 'red'
+                });
+            }
+            
+            if (layerGroups.pois.length > 0) {
+                layerConfigs.push({
+                    key: 'pois',
+                    name: 'Points of Interest',
+                    color: 'purple',
+                    count: layerGroups.pois.length
                 });
             }
 
@@ -1944,6 +2383,58 @@ async def read_index():
             }
         }
 
+        function getRangeText(percentChange) {
+            const absChange = Math.abs(percentChange);
+            if (absChange === 0) return '0';
+            if (absChange <= 5) return '0–5';
+            if (absChange <= 15) return '5–15';
+            if (absChange <= 30) return '15–30';
+            if (absChange <= 50) return '30–50';
+            return '>50';
+        }
+
+        function getSignificance(percentChange) {
+            const absChange = Math.abs(percentChange);
+            
+            if (absChange === 0) {
+                return {
+                    level: 'No Change',
+                    class: 'significance-no-change',
+                    description: 'No difference in walking access; the park removal has no measurable network impact.'
+                };
+            } else if (absChange <= 5) {
+                return {
+                    level: 'Minimal',
+                    class: 'significance-minimal',
+                    description: 'Little change in walking access; added paths have negligible network impact.'
+                };
+            } else if (absChange <= 15) {
+                return {
+                    level: 'Notable', 
+                    class: 'significance-notable',
+                    description: 'Clear, measurable improvement in walking routes and connectivity.'
+                };
+            } else if (absChange <= 30) {
+                return {
+                    level: 'Strong',
+                    class: 'significance-strong', 
+                    description: 'Substantial gains in walking accessibility.'
+                };
+            } else if (absChange <= 50) {
+                return {
+                    level: 'High',
+                    class: 'significance-high',
+                    description: 'Major enhancement; walking network performs far better, enabling new trip patterns.'
+                };
+            } else {
+                return {
+                    level: 'Transformative',
+                    class: 'significance-transformative',
+                    description: 'Game-changing connectivity; walking opportunities expand dramatically across the area.'
+                };
+            }
+        }
+
         function toggleLayer(layerKey, show) {
             layerVisibility[layerKey] = show;
             
@@ -1975,6 +2466,14 @@ async def read_index():
                 } else {
                     map.removeLayer(layerGroups.withoutPark);
                 }
+            } else if (layerKey === 'pois') {
+                layerGroups.pois.forEach(layer => {
+                    if (show) {
+                        map.addLayer(layer);
+                    } else {
+                        map.removeLayer(layer);
+                    }
+                });
             }
         }
 
@@ -2020,6 +2519,9 @@ async def read_index():
 
                 parksData = data.parks;
                 nodesData = data.nodes;
+                
+                // Store POI data
+                poisData = data.pois || [];
 
                 // Update map center
                 map.setView([lat, lng], 13);
@@ -2059,11 +2561,28 @@ async def read_index():
                     option.textContent = `${park.name} (${Math.round(park.area_m2/1000)}k m²)`;
                     parkSelect.appendChild(option);
                 });
+                
+                // Add POIs to map
+                poisData.forEach(poi => {
+                    // Create custom marker with emoji
+                    const poiMarker = L.marker([poi.lat, poi.lng], {
+                        title: `${poi.emoji} ${poi.name}`
+                    });
+                    
+                    // Only add to map if POIs are visible  
+                    if (layerVisibility.pois) {
+                        poiMarker.addTo(map);
+                    }
+                    
+                    poiMarker.bindPopup(`<b>${poi.emoji} ${poi.name}</b><br>Type: ${poi.type}`);
+                    
+                    layerGroups.pois.push(poiMarker);
+                });
 
                 updateLayerControls();
 
                 parkSelect.disabled = false;
-                showStatus(`Loaded ${parksData.length} parks and ${nodesData.length} nodes`, 'success');
+                showStatus(`Loaded ${parksData.length} parks, ${nodesData.length} nodes, and ${poisData.length} POIs`, 'success');
                 
                 setTimeout(hideStatus, 3000);
                 
@@ -2089,6 +2608,7 @@ async def read_index():
             layerGroups.nodes = [];
             layerGroups.withPark = null;
             layerGroups.withoutPark = null;
+            layerGroups.pois = [];
             
             // Update controls
             updateLayerControls();
@@ -2335,43 +2855,169 @@ async def read_index():
             const metrics = document.getElementById('metrics');
             const impactClass = `impact-${results.impact_category.replace('_', '-')}`;
             
+            // Calculate differences safely with null checks
+            const withPark = results.with_park || {};
+            const withoutPark = results.without_park || {};
+            const enhanced = results.enhanced_metrics || {};
+            
+            // Calculate percentage changes from base (without park) values
+            const areaWithout = withoutPark.area_km2 || 0;
+            const areaWith = withPark.area_km2 || 0;
+            const areaChange = areaWithout > 0 ? ((areaWith - areaWithout) / areaWithout) * 100 : 0;
+            
+            const streetWithout = enhanced.without_street_length_km || 0;
+            const streetWith = enhanced.with_street_length_km || 0;
+            const streetChange = streetWithout > 0 ? ((streetWith - streetWithout) / streetWithout) * 100 : 0;
+            
+            const supermarketsWithout = enhanced.without_supermarkets_accessible || 0;
+            const supermarketsWith = enhanced.with_supermarkets_accessible || 0;
+            const supermarketsChange = supermarketsWithout > 0 ? ((supermarketsWith - supermarketsWithout) / supermarketsWithout) * 100 : 0;
+            
+            const schoolsWithout = enhanced.without_schools_accessible || 0;
+            const schoolsWith = enhanced.with_schools_accessible || 0;
+            const schoolsChange = schoolsWithout > 0 ? ((schoolsWith - schoolsWithout) / schoolsWithout) * 100 : 0;
+            
+            const playgroundsWithout = enhanced.without_playgrounds_accessible || 0;
+            const playgroundsWith = enhanced.with_playgrounds_accessible || 0;
+            const playgroundsChange = playgroundsWithout > 0 ? ((playgroundsWith - playgroundsWithout) / playgroundsWithout) * 100 : 0;
+            
+            const cafesBarsWithout = enhanced.without_cafes_bars_accessible || 0;
+            const cafesBarsWith = enhanced.with_cafes_bars_accessible || 0;
+            const cafesBarsChange = cafesBarsWithout > 0 ? ((cafesBarsWith - cafesBarsWithout) / cafesBarsWithout) * 100 : 0;
+            
+            const transitWithout = enhanced.without_transit_accessible || 0;
+            const transitWith = enhanced.with_transit_accessible || 0;
+            const transitChange = transitWithout > 0 ? ((transitWith - transitWithout) / transitWithout) * 100 : 0;
+            
             metrics.innerHTML = `
-                <div class="metric">
-                    <div class="metric-value">${results.with_park.area_km2.toFixed(3)} km²</div>
-                    <div class="metric-label">WITH Park (Area)</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-value">${results.enhanced_metrics.with_street_length_km.toFixed(3)} km</div>
-                    <div class="metric-label">WITH Park (Streets)</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-value">${results.without_park.area_km2.toFixed(3)} km²</div>
-                    <div class="metric-label">WITHOUT Park (Area)</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-value">${results.enhanced_metrics.without_street_length_km.toFixed(3)} km</div>
-                    <div class="metric-label">WITHOUT Park (Streets)</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-value ${impactClass}">${results.street_network_difference_km > 0 ? '+' : ''}${results.street_network_difference_km.toFixed(3)} km</div>
-                    <div class="metric-label">Street Impact (${results.street_network_change_pct.toFixed(1)}%)</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-value ${impactClass} tooltip">
-                        ${results.impact_label}
-                        <span class="tooltiptext">${getImpactTooltip(results.impact_category, results.impact_label)}</span>
-                    </div>
-                    <div class="metric-label">Overall Assessment</div>
-                </div>
+                <table class="comparison-table">
+                    <thead>
+                        <tr>
+                            <th>Metric</th>
+                            <th>Without Park</th>
+                            <th>With Park</th>
+                            <th>Difference</th>
+                            <th>Significance</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>Accessible Area</td>
+                            <td>${areaWithout.toFixed(3)} <span class="metric-unit">km²</span></td>
+                            <td>${areaWith.toFixed(3)} <span class="metric-unit">km²</span></td>
+                            <td class="${areaChange > 0 ? 'impact-positive' : areaChange < 0 ? 'impact-negative' : 'impact-neutral'}">${areaChange > 0 ? '+' : ''}${areaChange.toFixed(1)} <span class="metric-unit">%</span></td>
+                            <td class="${getSignificance(areaChange).class}">
+                                <div class="tooltip">
+                                    ${getSignificance(areaChange).level}
+                                    <span class="tooltiptext">
+                                        <strong>${getSignificance(areaChange).level} (${getRangeText(areaChange)}%)</strong><br>
+                                        ${getSignificance(areaChange).description}
+                                    </span>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td>Street Network Length</td>
+                            <td>${streetWithout.toFixed(3)} <span class="metric-unit">km</span></td>
+                            <td>${streetWith.toFixed(3)} <span class="metric-unit">km</span></td>
+                            <td class="${streetChange > 0 ? 'impact-positive' : streetChange < 0 ? 'impact-negative' : 'impact-neutral'}">${streetChange > 0 ? '+' : ''}${streetChange.toFixed(1)} <span class="metric-unit">%</span></td>
+                            <td class="${getSignificance(streetChange).class}">
+                                <div class="tooltip">
+                                    ${getSignificance(streetChange).level}
+                                    <span class="tooltiptext">
+                                        <strong>${getSignificance(streetChange).level} (${getRangeText(streetChange)}%)</strong><br>
+                                        ${getSignificance(streetChange).description}
+                                    </span>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td>🥖 Accessible Supermarkets</td>
+                            <td>${supermarketsWithout} <span class="metric-unit">count</span></td>
+                            <td>${supermarketsWith} <span class="metric-unit">count</span></td>
+                            <td class="${supermarketsChange > 0 ? 'impact-positive' : supermarketsChange < 0 ? 'impact-negative' : 'impact-neutral'}">${supermarketsChange > 0 ? '+' : ''}${supermarketsChange.toFixed(1)} <span class="metric-unit">%</span></td>
+                            <td class="${getSignificance(supermarketsChange).class}">
+                                <div class="tooltip">
+                                    ${getSignificance(supermarketsChange).level}
+                                    <span class="tooltiptext">
+                                        <strong>${getSignificance(supermarketsChange).level} (${getRangeText(supermarketsChange)}%)</strong><br>
+                                        ${getSignificance(supermarketsChange).description}
+                                    </span>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td>🏫 Accessible Schools</td>
+                            <td>${schoolsWithout} <span class="metric-unit">count</span></td>
+                            <td>${schoolsWith} <span class="metric-unit">count</span></td>
+                            <td class="${schoolsChange > 0 ? 'impact-positive' : schoolsChange < 0 ? 'impact-negative' : 'impact-neutral'}">${schoolsChange > 0 ? '+' : ''}${schoolsChange.toFixed(1)} <span class="metric-unit">%</span></td>
+                            <td class="${getSignificance(schoolsChange).class}">
+                                <div class="tooltip">
+                                    ${getSignificance(schoolsChange).level}
+                                    <span class="tooltiptext">
+                                        <strong>${getSignificance(schoolsChange).level} (${getRangeText(schoolsChange)}%)</strong><br>
+                                        ${getSignificance(schoolsChange).description}
+                                    </span>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td>🛝 Accessible Playgrounds</td>
+                            <td>${playgroundsWithout} <span class="metric-unit">count</span></td>
+                            <td>${playgroundsWith} <span class="metric-unit">count</span></td>
+                            <td class="${playgroundsChange > 0 ? 'impact-positive' : playgroundsChange < 0 ? 'impact-negative' : 'impact-neutral'}">${playgroundsChange > 0 ? '+' : ''}${playgroundsChange.toFixed(1)} <span class="metric-unit">%</span></td>
+                            <td class="${getSignificance(playgroundsChange).class}">
+                                <div class="tooltip">
+                                    ${getSignificance(playgroundsChange).level}
+                                    <span class="tooltiptext">
+                                        <strong>${getSignificance(playgroundsChange).level} (${getRangeText(playgroundsChange)}%)</strong><br>
+                                        ${getSignificance(playgroundsChange).description}
+                                    </span>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td>☕ Accessible Cafes/Bars</td>
+                            <td>${cafesBarsWithout} <span class="metric-unit">count</span></td>
+                            <td>${cafesBarsWith} <span class="metric-unit">count</span></td>
+                            <td class="${cafesBarsChange > 0 ? 'impact-positive' : cafesBarsChange < 0 ? 'impact-negative' : 'impact-neutral'}">${cafesBarsChange > 0 ? '+' : ''}${cafesBarsChange.toFixed(1)} <span class="metric-unit">%</span></td>
+                            <td class="${getSignificance(cafesBarsChange).class}">
+                                <div class="tooltip">
+                                    ${getSignificance(cafesBarsChange).level}
+                                    <span class="tooltiptext">
+                                        <strong>${getSignificance(cafesBarsChange).level} (${getRangeText(cafesBarsChange)}%)</strong><br>
+                                        ${getSignificance(cafesBarsChange).description}
+                                    </span>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td>🚌 Accessible Transit Stops</td>
+                            <td>${transitWithout} <span class="metric-unit">count</span></td>
+                            <td>${transitWith} <span class="metric-unit">count</span></td>
+                            <td class="${transitChange > 0 ? 'impact-positive' : transitChange < 0 ? 'impact-negative' : 'impact-neutral'}">${transitChange > 0 ? '+' : ''}${transitChange.toFixed(1)} <span class="metric-unit">%</span></td>
+                            <td class="${getSignificance(transitChange).class}">
+                                <div class="tooltip">
+                                    ${getSignificance(transitChange).level}
+                                    <span class="tooltiptext">
+                                        <strong>${getSignificance(transitChange).level} (${getRangeText(transitChange)}%)</strong><br>
+                                        ${getSignificance(transitChange).description}
+                                    </span>
+                                </div>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
             `;
 
-            // Display enhanced metrics
-            displayEnhancedMetrics(results);
             
             // Create charts
             createSingleAnalysisCharts(results);
 
-            document.getElementById('results').style.display = 'block';
+            // Only show results if single analysis tab is active
+            if (document.getElementById('singleAnalysisTab').classList.contains('active')) {
+                document.getElementById('results').style.display = 'block';
+            }
         }
 
         function displayEnhancedMetrics(results) {
@@ -2910,7 +3556,10 @@ async def read_index():
             `;
             
             document.getElementById('massTable').innerHTML = tableHtml;
-            document.getElementById('massResults').style.display = 'block';
+            // Only show results if mass analysis tab is active
+            if (document.getElementById('massAnalysisTab').classList.contains('active')) {
+                document.getElementById('massResults').style.display = 'block';
+            }
             
             // Scroll to results
             document.getElementById('massResults').scrollIntoView({ behavior: 'smooth' });
@@ -3215,11 +3864,51 @@ async def read_index():
 async def load_data(lat: float, lng: float, radius: int = 2000):
     """Load parks and street network data for an area"""
     try:
+        import numpy as np
         data = await analyzer.load_area_data(lat, lng, radius)
+        # Format POI data for frontend
+        pois = []
+        poi_types = [
+            ('supermarkets_gdf', '🥖', 'Supermarket'),
+            ('schools_gdf', '🏫', 'School'), 
+            ('playgrounds_gdf', '🛝', 'Playground'),
+            ('cafes_bars_gdf', '☕', 'Cafe/Bar'),
+            ('transit_gdf', '🚌', 'Transit')
+        ]
+        
+        for key, emoji, type_name in poi_types:
+            if key in data and data[key] is not None and not data[key].empty:
+                for idx, poi in data[key].iterrows():
+                    try:
+                        if hasattr(poi.geometry, 'centroid'):
+                            point = poi.geometry.centroid
+                        else:
+                            point = poi.geometry
+                        
+                        lat = float(point.y)
+                        lng = float(point.x)
+                        
+                        # Validate coordinates are finite
+                        if not (np.isfinite(lat) and np.isfinite(lng)):
+                            continue
+                            
+                        name = poi.get('name', f'Unnamed {type_name}')
+                        pois.append({
+                            'id': f'{key}_{idx}',
+                            'name': str(name),
+                            'type': type_name,
+                            'emoji': emoji,
+                            'lat': lat,
+                            'lng': lng
+                        })
+                    except Exception as e:
+                        continue
+        
         return {
             'parks': data['parks'],
             'nodes': data['nodes'],
-            'center': data['center']
+            'center': data['center'],
+            'pois': pois
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
