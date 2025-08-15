@@ -1876,7 +1876,7 @@ async def read_index():
                     <label for="vizMethod">Visualization Method:</label>
                     <select id="vizMethod">
                         <option value="convex_hull">Convex Hull (Fast)</option>
-                        <option value="buffered_network">Buffered Streets (Realistic)</option>
+                        <option value="buffered_network" selected>Buffered Streets (Realistic)</option>
                     </select>
                 </div>
                 <div class="control-group">
@@ -1916,12 +1916,8 @@ async def read_index():
                 <div class="controls">
                     <div class="control-group">
                         <label for="massNodeCount">Number of nodes to analyze:</label>
-                        <select id="massNodeCount">
-                            <option value="5">5 nodes (Quick)</option>
-                            <option value="10" selected>10 nodes (Balanced)</option>
-                            <option value="20">20 nodes (Comprehensive)</option>
-                            <option value="30">30 nodes (Detailed)</option>
-                        </select>
+                        <input type="number" id="massNodeCount" min="2" max="50" value="10" step="1" style="width: 80px;">
+                        <span id="massNodeRange" style="color: #6c757d; font-size: 12px; margin-left: 10px;">Range: 2 - 50 nodes</span>
                     </div>
                     <div class="control-group">
                         <label for="massRadius">Node search radius (m):</label>
@@ -1964,28 +1960,14 @@ async def read_index():
             <h3>📈 Mass Analysis Results</h3>
             <div id="massOverview" class="metrics"></div>
             
-            <div class="step">
-                <h4>📊 Statistical Summary</h4>
-                <div id="massStats" class="metrics"></div>
-            </div>
             
             <div class="step">
                 <h4>📈 Interactive Visualizations</h4>
-                <div class="charts-grid">
-                    <div class="chart-container">
-                        <canvas id="massComparisonChart"></canvas>
-                    </div>
-                    <div class="chart-container">
-                        <canvas id="impactDistributionChart"></canvas>
-                    </div>
+                <div class="chart-container" style="margin-bottom: 30px;">
+                    <canvas id="massComparisonChart"></canvas>
                 </div>
-                <div class="charts-grid">
-                    <div class="chart-container">
-                        <canvas id="scatterPlotChart"></canvas>
-                    </div>
-                    <div class="chart-container">
-                        <canvas id="impactCategoriesChart"></canvas>
-                    </div>
+                <div class="chart-container">
+                    <canvas id="impactCategoriesChart"></canvas>
                 </div>
             </div>
             
@@ -2393,6 +2375,101 @@ async def read_index():
             return '>50';
         }
 
+        function calculateMetricStats(values) {
+            if (!values || values.length === 0) return null;
+            
+            const sorted = [...values].sort((a, b) => a - b);
+            const len = sorted.length;
+            
+            const min = sorted[0];
+            const max = sorted[len - 1];
+            const avg = values.reduce((sum, val) => sum + val, 0) / len;
+            
+            // Calculate standard deviation
+            const variance = values.reduce((sum, val) => sum + Math.pow(val - avg, 2), 0) / len;
+            const stdDev = Math.sqrt(variance);
+            
+            // Calculate percentiles
+            const q1Index = Math.floor(len * 0.25);
+            const q3Index = Math.floor(len * 0.75);
+            const q1 = sorted[q1Index];
+            const q3 = sorted[q3Index];
+            
+            return {
+                min: min,
+                max: max,
+                avg: avg,
+                stdDev: stdDev,
+                q1: q1,
+                q3: q3,
+                count: len
+            };
+        }
+
+        function createRangeBar(stats, value, unit = '', isPercentage = false) {
+            if (!stats) return '';
+            
+            const range = stats.max - stats.min;
+            const avgPosition = range > 0 ? ((stats.avg - stats.min) / range) * 100 : 50;
+            const q1Position = range > 0 ? ((stats.q1 - stats.min) / range) * 100 : 25;
+            const q3Position = range > 0 ? ((stats.q3 - stats.min) / range) * 100 : 75;
+            
+            const formatValue = (val) => isPercentage ? `${val.toFixed(1)}%` : `${val.toFixed(3)}${unit}`;
+            
+            return `
+                <div class="range-bar-container" style="margin: 10px 0;">
+                    <div class="range-labels" style="display: flex; justify-content: space-between; font-size: 11px; color: #666; margin-bottom: 2px;">
+                        <span>Min: ${formatValue(stats.min)}</span>
+                        <span>Avg: ${formatValue(stats.avg)}</span>
+                        <span>Max: ${formatValue(stats.max)}</span>
+                    </div>
+                    <div class="range-bar" style="position: relative; height: 20px; background: #e9ecef; border-radius: 10px; overflow: hidden;">
+                        <div class="range-iqr" style="position: absolute; left: ${q1Position}%; width: ${q3Position - q1Position}%; height: 100%; background: rgba(40, 167, 69, 0.3);"></div>
+                        <div class="range-avg-marker" style="position: absolute; left: ${avgPosition}%; width: 2px; height: 100%; background: #007bff; transform: translateX(-50%);"></div>
+                        <div class="range-value-text" style="position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); font-size: 10px; font-weight: bold; color: #495057;">
+                            ${formatValue(value)}
+                        </div>
+                    </div>
+                    <div class="range-stats" style="font-size: 10px; color: #6c757d; margin-top: 2px;">
+                        Std Dev: ${formatValue(stats.stdDev)} | IQR: ${formatValue(stats.q1)} - ${formatValue(stats.q3)}
+                    </div>
+                </div>
+            `;
+        }
+
+        function toggleMetricDetails(metricId) {
+            const detailsRow = document.getElementById(`details-${metricId}`);
+            const icon = document.getElementById(`icon-${metricId}`);
+            
+            if (detailsRow.style.display === 'none' || detailsRow.style.display === '') {
+                detailsRow.style.display = 'table-row';
+                icon.textContent = '▼';
+            } else {
+                detailsRow.style.display = 'none';
+                icon.textContent = '▶';
+            }
+        }
+
+        function isPointInPolygon(point, polygon) {
+            // Ray casting algorithm to check if point is inside polygon
+            const x = point[1]; // longitude
+            const y = point[0]; // latitude
+            let inside = false;
+            
+            for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+                const xi = polygon[i][1]; // longitude
+                const yi = polygon[i][0]; // latitude
+                const xj = polygon[j][1]; // longitude
+                const yj = polygon[j][0]; // latitude
+                
+                if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) {
+                    inside = !inside;
+                }
+            }
+            
+            return inside;
+        }
+
         function getSignificance(percentChange) {
             const absChange = Math.abs(percentChange);
             
@@ -2679,13 +2756,21 @@ async def read_index():
             const nodeSelect = document.getElementById('nodeSelect');
             nodeSelect.innerHTML = '<option value="">Select a node...</option>';
             
-            // Filter nodes near park (within reasonable distance)
+            // Filter nodes near park (within reasonable distance) but NOT inside the park
             const nearbyNodes = nodesData.filter(node => {
                 const distance = getDistance(
                     selectedPark.centroid[0], selectedPark.centroid[1],
                     node.lat, node.lng
                 );
-                return distance < 800; // Within 800m of park
+                
+                // Check if node is within reasonable distance
+                if (distance >= 800) return false;
+                
+                // Check if node is inside the park - exclude if it is
+                const nodePoint = [node.lat, node.lng];
+                const isInsidePark = isPointInPolygon(nodePoint, selectedPark.coords);
+                
+                return !isInsidePark; // Return true only if NOT inside park
             });
             
             nearbyNodes.forEach(node => {
@@ -2720,6 +2805,16 @@ async def read_index():
             });
             
             updateLayerControls();
+            
+            // Update mass analysis node count range based on available nodes
+            const massNodeCount = document.getElementById('massNodeCount');
+            const massNodeRange = document.getElementById('massNodeRange');
+            const maxNodes = Math.max(2, nearbyNodes.length);
+            massNodeCount.max = maxNodes;
+            if (massNodeCount.value > maxNodes) {
+                massNodeCount.value = maxNodes;
+            }
+            massNodeRange.textContent = `Range: 2 - ${maxNodes} nodes (${maxNodes} available)`;
             
             nodeSelect.disabled = false;
             document.getElementById('analyzeBtn').disabled = false;
@@ -3209,13 +3304,21 @@ async def read_index():
             const selectedPark = parksData.find(p => p.id === parkId);
             if (!selectedPark) return;
 
-            // Get nearby nodes for mass analysis
+            // Get nearby nodes for mass analysis (excluding nodes inside the park)
             const nearbyNodes = nodesData.filter(node => {
                 const distance = getDistance(
                     selectedPark.centroid[0], selectedPark.centroid[1],
                     node.lat, node.lng
                 );
-                return distance < searchRadius;
+                
+                // Check if node is within search radius
+                if (distance >= searchRadius) return false;
+                
+                // Check if node is inside the park - exclude if it is
+                const nodePoint = [node.lat, node.lng];
+                const isInsidePark = isPointInPolygon(nodePoint, selectedPark.coords);
+                
+                return !isInsidePark; // Return true only if NOT inside park
             });
 
             if (nearbyNodes.length === 0) {
@@ -3336,6 +3439,17 @@ async def read_index():
                             street_network_difference: result.street_network_difference_km || 0,
                             area_change_pct: result.area_change_pct || 0,
                             street_network_change_pct: result.street_network_change_pct || 0,
+                            // Amenity data
+                            with_supermarkets: result.enhanced_metrics?.with_supermarkets_accessible || 0,
+                            without_supermarkets: result.enhanced_metrics?.without_supermarkets_accessible || 0,
+                            with_schools: result.enhanced_metrics?.with_schools_accessible || 0,
+                            without_schools: result.enhanced_metrics?.without_schools_accessible || 0,
+                            with_playgrounds: result.enhanced_metrics?.with_playgrounds_accessible || 0,
+                            without_playgrounds: result.enhanced_metrics?.without_playgrounds_accessible || 0,
+                            with_cafes_bars: result.enhanced_metrics?.with_cafes_bars_accessible || 0,
+                            without_cafes_bars: result.enhanced_metrics?.without_cafes_bars_accessible || 0,
+                            with_transit: result.enhanced_metrics?.with_transit_accessible || 0,
+                            without_transit: result.enhanced_metrics?.without_transit_accessible || 0,
                             with_nodes: result.with_park?.reachable_nodes || 0,
                             without_nodes: result.without_park?.reachable_nodes || 0,
                             node_difference: result.node_difference || 0,
@@ -3392,14 +3506,16 @@ async def read_index():
 
             const avgDifference = differences.reduce((a, b) => a + b, 0) / differences.length;
             const avgStreetNetworkDifference = streetNetworkDifferences.reduce((a, b) => a + b, 0) / streetNetworkDifferences.length;
-            const avgAreaChangePct = areaChangePcts.reduce((a, b) => a + b, 0) / areaChangePcts.length;
-            const avgStreetNetworkChangePct = streetNetworkChangePcts.reduce((a, b) => a + b, 0) / streetNetworkChangePcts.length;
             const maxDifference = Math.max(...differences);
             const minDifference = Math.min(...differences);
             const avgWithArea = withAreas.reduce((a, b) => a + b, 0) / withAreas.length;
             const avgWithoutArea = withoutAreas.reduce((a, b) => a + b, 0) / withoutAreas.length;
             const avgWithStreetLength = withStreetLengths.reduce((a, b) => a + b, 0) / withStreetLengths.length;
             const avgWithoutStreetLength = withoutStreetLengths.reduce((a, b) => a + b, 0) / withoutStreetLengths.length;
+            
+            // Fix percentage calculation: should be (with - without) / without * 100
+            const avgAreaChangePct = avgWithoutArea > 0 ? ((avgWithArea - avgWithoutArea) / avgWithoutArea * 100) : 0;
+            const avgStreetNetworkChangePct = avgWithoutStreetLength > 0 ? ((avgWithStreetLength - avgWithoutStreetLength) / avgWithoutStreetLength * 100) : 0;
 
             // Enhanced impact classification (5 levels)
             const impactCounts = {
@@ -3416,91 +3532,415 @@ async def read_index():
             const neutralImpact = impactCounts.neutral;
 
             // Display overview
-            document.getElementById('massOverview').innerHTML = `
-                <div class="metric">
-                    <div class="metric-value">${massResultsData.length}</div>
-                    <div class="metric-label">Nodes Analyzed</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-value">${avgWithArea.toFixed(3)} km²</div>
-                    <div class="metric-label">Avg WITH Park (Area)</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-value">${avgWithStreetLength.toFixed(3)} km</div>
-                    <div class="metric-label">Avg WITH Park (Streets)</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-value">${avgWithoutArea.toFixed(3)} km²</div>
-                    <div class="metric-label">Avg WITHOUT Park (Area)</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-value">${avgWithoutStreetLength.toFixed(3)} km</div>
-                    <div class="metric-label">Avg WITHOUT Park (Streets)</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-value">${avgStreetNetworkDifference > 0 ? '+' : ''}${avgStreetNetworkDifference.toFixed(3)} km</div>
-                    <div class="metric-label">Average Street Impact (${avgStreetNetworkChangePct.toFixed(1)}%)</div>
-                </div>
-            `;
+            // Clear the overview - we'll only show the averaged comparison table
+            document.getElementById('massOverview').innerHTML = ``;
 
-            // Display statistics
-            document.getElementById('massStats').innerHTML = `
-                <div class="metric">
-                    <div class="metric-value">${maxDifference.toFixed(3)} km²</div>
-                    <div class="metric-label">Max Impact</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-value">${minDifference.toFixed(3)} km²</div>
-                    <div class="metric-label">Min Impact</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-value">${avgAreaChangePct.toFixed(1)}%</div>
-                    <div class="metric-label">Avg % Change</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-value impact-highly-positive">${impactCounts.highly_positive}</div>
-                    <div class="metric-label">Highly Positive</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-value impact-positive">${impactCounts.positive}</div>
-                    <div class="metric-label">Positive</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-value impact-neutral">${impactCounts.neutral}</div>
-                    <div class="metric-label">Neutral</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-value impact-negative">${impactCounts.negative}</div>
-                    <div class="metric-label">Negative</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-value impact-highly-negative">${impactCounts.highly_negative}</div>
-                    <div class="metric-label">Highly Negative</div>
+            // Calculate averaged amenity data
+            const avgWithSupermarkets = massResultsData.reduce((sum, r) => sum + r.with_supermarkets, 0) / massResultsData.length;
+            const avgWithoutSupermarkets = massResultsData.reduce((sum, r) => sum + r.without_supermarkets, 0) / massResultsData.length;
+            const avgWithSchools = massResultsData.reduce((sum, r) => sum + r.with_schools, 0) / massResultsData.length;
+            const avgWithoutSchools = massResultsData.reduce((sum, r) => sum + r.without_schools, 0) / massResultsData.length;
+            const avgWithPlaygrounds = massResultsData.reduce((sum, r) => sum + r.with_playgrounds, 0) / massResultsData.length;
+            const avgWithoutPlaygrounds = massResultsData.reduce((sum, r) => sum + r.without_playgrounds, 0) / massResultsData.length;
+            const avgWithCafesBars = massResultsData.reduce((sum, r) => sum + r.with_cafes_bars, 0) / massResultsData.length;
+            const avgWithoutCafesBars = massResultsData.reduce((sum, r) => sum + r.without_cafes_bars, 0) / massResultsData.length;
+            const avgWithTransit = massResultsData.reduce((sum, r) => sum + r.with_transit, 0) / massResultsData.length;
+            const avgWithoutTransit = massResultsData.reduce((sum, r) => sum + r.without_transit, 0) / massResultsData.length;
+
+            // Calculate percentage changes for amenities
+            const supermarketsChangePct = avgWithoutSupermarkets > 0 ? ((avgWithSupermarkets - avgWithoutSupermarkets) / avgWithoutSupermarkets * 100) : 0;
+            const schoolsChangePct = avgWithoutSchools > 0 ? ((avgWithSchools - avgWithoutSchools) / avgWithoutSchools * 100) : 0;
+            const playgroundsChangePct = avgWithoutPlaygrounds > 0 ? ((avgWithPlaygrounds - avgWithoutPlaygrounds) / avgWithoutPlaygrounds * 100) : 0;
+            const cafesBarsChangePct = avgWithoutCafesBars > 0 ? ((avgWithCafesBars - avgWithoutCafesBars) / avgWithoutCafesBars * 100) : 0;
+            const transitChangePct = avgWithoutTransit > 0 ? ((avgWithTransit - avgWithoutTransit) / avgWithoutTransit * 100) : 0;
+
+            // Calculate statistics for all metrics
+            const withAreaStats = calculateMetricStats(massResultsData.map(r => r.with_area));
+            const withoutAreaStats = calculateMetricStats(massResultsData.map(r => r.without_area));
+            const areaDiffStats = calculateMetricStats(massResultsData.map(r => r.difference));
+            const areaChangePctStats = calculateMetricStats(massResultsData.map(r => {
+                const without = r.without_area;
+                const with_ = r.with_area;
+                return without > 0 ? ((with_ - without) / without * 100) : 0;
+            }));
+            
+            const withStreetStats = calculateMetricStats(massResultsData.map(r => r.with_street_length));
+            const withoutStreetStats = calculateMetricStats(massResultsData.map(r => r.without_street_length));
+            const streetDiffStats = calculateMetricStats(massResultsData.map(r => r.street_network_difference));
+            const streetChangePctStats = calculateMetricStats(massResultsData.map(r => {
+                const without = r.without_street_length;
+                const with_ = r.with_street_length;
+                return without > 0 ? ((with_ - without) / without * 100) : 0;
+            }));
+            
+            const withSupermarketsStats = calculateMetricStats(massResultsData.map(r => r.with_supermarkets));
+            const withoutSupermarketsStats = calculateMetricStats(massResultsData.map(r => r.without_supermarkets));
+            const supermarketsChangePctStats = calculateMetricStats(massResultsData.map(r => {
+                const without = r.without_supermarkets;
+                const with_ = r.with_supermarkets;
+                return without > 0 ? ((with_ - without) / without * 100) : 0;
+            }));
+            
+            const withSchoolsStats = calculateMetricStats(massResultsData.map(r => r.with_schools));
+            const withoutSchoolsStats = calculateMetricStats(massResultsData.map(r => r.without_schools));
+            const schoolsChangePctStats = calculateMetricStats(massResultsData.map(r => {
+                const without = r.without_schools;
+                const with_ = r.with_schools;
+                return without > 0 ? ((with_ - without) / without * 100) : 0;
+            }));
+            
+            const withPlaygroundsStats = calculateMetricStats(massResultsData.map(r => r.with_playgrounds));
+            const withoutPlaygroundsStats = calculateMetricStats(massResultsData.map(r => r.without_playgrounds));
+            const playgroundsChangePctStats = calculateMetricStats(massResultsData.map(r => {
+                const without = r.without_playgrounds;
+                const with_ = r.with_playgrounds;
+                return without > 0 ? ((with_ - without) / without * 100) : 0;
+            }));
+            
+            const withCafesBarsStats = calculateMetricStats(massResultsData.map(r => r.with_cafes_bars));
+            const withoutCafesBarsStats = calculateMetricStats(massResultsData.map(r => r.without_cafes_bars));
+            const cafesBarsChangePctStats = calculateMetricStats(massResultsData.map(r => {
+                const without = r.without_cafes_bars;
+                const with_ = r.with_cafes_bars;
+                return without > 0 ? ((with_ - without) / without * 100) : 0;
+            }));
+            
+            const withTransitStats = calculateMetricStats(massResultsData.map(r => r.with_transit));
+            const withoutTransitStats = calculateMetricStats(massResultsData.map(r => r.without_transit));
+            const transitChangePctStats = calculateMetricStats(massResultsData.map(r => {
+                const without = r.without_transit;
+                const with_ = r.with_transit;
+                return without > 0 ? ((with_ - without) / without * 100) : 0;
+            }));
+
+            // Pre-calculate all significance data to avoid function calls in template
+            const areaSignificance = getSignificance(avgAreaChangePct);
+            const streetSignificance = getSignificance(avgStreetNetworkChangePct);
+            const supermarketsSignificance = getSignificance(supermarketsChangePct);
+            const schoolsSignificance = getSignificance(schoolsChangePct);
+            const playgroundsSignificance = getSignificance(playgroundsChangePct);
+            const cafesBarsSignificance = getSignificance(cafesBarsChangePct);
+            const transitSignificance = getSignificance(transitChangePct);
+            
+            const areaRange = getRangeText(avgAreaChangePct);
+            const streetRange = getRangeText(avgStreetNetworkChangePct);
+            const supermarketsRange = getRangeText(supermarketsChangePct);
+            const schoolsRange = getRangeText(schoolsChangePct);
+            const playgroundsRange = getRangeText(playgroundsChangePct);
+            const cafesBarsRange = getRangeText(cafesBarsChangePct);
+            const transitRange = getRangeText(transitChangePct);
+
+            // Add averaged comparison table after overview
+            const massOverviewElement = document.getElementById('massOverview');
+            const averagedTableHTML = `
+                <div style="margin-top: 30px;">
+                    <h4>📊 Averaged Comparison (${massResultsData.length} nodes)</h4>
+                    <div class="comparison-table-container">
+                        <table class="comparison-table">
+                            <thead>
+                                <tr>
+                                    <th>Metric</th>
+                                    <th>Without Park</th>
+                                    <th>With Park</th>
+                                    <th>Difference</th>
+                                    <th>Significance</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr style="cursor: pointer;" onclick="toggleMetricDetails('area')">
+                                    <td><span id="icon-area">▶</span> Accessible Area</td>
+                                    <td>${avgWithoutArea.toFixed(3)} <span class="metric-unit">km²</span></td>
+                                    <td>${avgWithArea.toFixed(3)} <span class="metric-unit">km²</span></td>
+                                    <td class="${avgAreaChangePct > 0 ? 'impact-positive' : avgAreaChangePct < 0 ? 'impact-negative' : 'impact-neutral'}">${avgAreaChangePct > 0 ? '+' : ''}${avgAreaChangePct.toFixed(1)} <span class="metric-unit">%</span></td>
+                                    <td class="${areaSignificance.class}">
+                                        <div class="tooltip">
+                                            ${areaSignificance.level}
+                                            <span class="tooltiptext">
+                                                <strong>${areaSignificance.level} (${areaRange}%)</strong><br>
+                                                ${areaSignificance.description}
+                                            </span>
+                                        </div>
+                                    </td>
+                                </tr>
+                                <tr id="details-area" style="display: none;">
+                                    <td colspan="5" style="padding: 15px; background: #f8f9fa; border-left: 3px solid #007bff;">
+                                        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px;">
+                                            <div>
+                                                <strong>Without Park Distribution</strong>
+                                                ${createRangeBar(withoutAreaStats, avgWithoutArea, ' km²')}
+                                            </div>
+                                            <div>
+                                                <strong>With Park Distribution</strong>
+                                                ${createRangeBar(withAreaStats, avgWithArea, ' km²')}
+                                            </div>
+                                            <div>
+                                                <strong>Change Distribution</strong>
+                                                ${createRangeBar(areaChangePctStats, avgAreaChangePct, '', true)}
+                                            </div>
+                                        </div>
+                                    </td>
+                                </tr>
+                                <tr style="cursor: pointer;" onclick="toggleMetricDetails('street')">
+                                    <td><span id="icon-street">▶</span> Street Network Length</td>
+                                    <td>${avgWithoutStreetLength.toFixed(3)} <span class="metric-unit">km</span></td>
+                                    <td>${avgWithStreetLength.toFixed(3)} <span class="metric-unit">km</span></td>
+                                    <td class="${avgStreetNetworkChangePct > 0 ? 'impact-positive' : avgStreetNetworkChangePct < 0 ? 'impact-negative' : 'impact-neutral'}">${avgStreetNetworkChangePct > 0 ? '+' : ''}${avgStreetNetworkChangePct.toFixed(1)} <span class="metric-unit">%</span></td>
+                                    <td class="${streetSignificance.class}">
+                                        <div class="tooltip">
+                                            ${streetSignificance.level}
+                                            <span class="tooltiptext">
+                                                <strong>${streetSignificance.level} (${streetRange}%)</strong><br>
+                                                ${streetSignificance.description}
+                                            </span>
+                                        </div>
+                                    </td>
+                                </tr>
+                                <tr id="details-street" style="display: none;">
+                                    <td colspan="5" style="padding: 15px; background: #f8f9fa; border-left: 3px solid #007bff;">
+                                        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px;">
+                                            <div>
+                                                <strong>Without Park Distribution</strong>
+                                                ${createRangeBar(withoutStreetStats, avgWithoutStreetLength, ' km')}
+                                            </div>
+                                            <div>
+                                                <strong>With Park Distribution</strong>
+                                                ${createRangeBar(withStreetStats, avgWithStreetLength, ' km')}
+                                            </div>
+                                            <div>
+                                                <strong>Change Distribution</strong>
+                                                ${createRangeBar(streetChangePctStats, avgStreetNetworkChangePct, '', true)}
+                                            </div>
+                                        </div>
+                                    </td>
+                                </tr>
+                                <tr style="cursor: pointer;" onclick="toggleMetricDetails('supermarkets')">
+                                    <td><span id="icon-supermarkets">▶</span> 🥖 Accessible Supermarkets</td>
+                                    <td>${avgWithoutSupermarkets.toFixed(1)} <span class="metric-unit">avg</span></td>
+                                    <td>${avgWithSupermarkets.toFixed(1)} <span class="metric-unit">avg</span></td>
+                                    <td class="${supermarketsChangePct > 0 ? 'impact-positive' : supermarketsChangePct < 0 ? 'impact-negative' : 'impact-neutral'}">${supermarketsChangePct > 0 ? '+' : ''}${supermarketsChangePct.toFixed(1)} <span class="metric-unit">%</span></td>
+                                    <td class="${supermarketsSignificance.class}">
+                                        <div class="tooltip">
+                                            ${supermarketsSignificance.level}
+                                            <span class="tooltiptext">
+                                                <strong>${supermarketsSignificance.level} (${supermarketsRange}%)</strong><br>
+                                                ${supermarketsSignificance.description}
+                                            </span>
+                                        </div>
+                                    </td>
+                                </tr>
+                                <tr id="details-supermarkets" style="display: none;">
+                                    <td colspan="5" style="padding: 15px; background: #f8f9fa; border-left: 3px solid #007bff;">
+                                        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px;">
+                                            <div>
+                                                <strong>Without Park Distribution</strong>
+                                                ${createRangeBar(withoutSupermarketsStats, avgWithoutSupermarkets, ' count')}
+                                            </div>
+                                            <div>
+                                                <strong>With Park Distribution</strong>
+                                                ${createRangeBar(withSupermarketsStats, avgWithSupermarkets, ' count')}
+                                            </div>
+                                            <div>
+                                                <strong>Change Distribution</strong>
+                                                ${createRangeBar(supermarketsChangePctStats, supermarketsChangePct, '', true)}
+                                            </div>
+                                        </div>
+                                    </td>
+                                </tr>
+                                <tr style="cursor: pointer;" onclick="toggleMetricDetails('schools')">
+                                    <td><span id="icon-schools">▶</span> 🏫 Accessible Schools</td>
+                                    <td>${avgWithoutSchools.toFixed(1)} <span class="metric-unit">avg</span></td>
+                                    <td>${avgWithSchools.toFixed(1)} <span class="metric-unit">avg</span></td>
+                                    <td class="${schoolsChangePct > 0 ? 'impact-positive' : schoolsChangePct < 0 ? 'impact-negative' : 'impact-neutral'}">${schoolsChangePct > 0 ? '+' : ''}${schoolsChangePct.toFixed(1)} <span class="metric-unit">%</span></td>
+                                    <td class="${schoolsSignificance.class}">
+                                        <div class="tooltip">
+                                            ${schoolsSignificance.level}
+                                            <span class="tooltiptext">
+                                                <strong>${schoolsSignificance.level} (${schoolsRange}%)</strong><br>
+                                                ${schoolsSignificance.description}
+                                            </span>
+                                        </div>
+                                    </td>
+                                </tr>
+                                <tr id="details-schools" style="display: none;">
+                                    <td colspan="5" style="padding: 15px; background: #f8f9fa; border-left: 3px solid #007bff;">
+                                        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px;">
+                                            <div>
+                                                <strong>Without Park Distribution</strong>
+                                                ${createRangeBar(withoutSchoolsStats, avgWithoutSchools, ' count')}
+                                            </div>
+                                            <div>
+                                                <strong>With Park Distribution</strong>
+                                                ${createRangeBar(withSchoolsStats, avgWithSchools, ' count')}
+                                            </div>
+                                            <div>
+                                                <strong>Change Distribution</strong>
+                                                ${createRangeBar(schoolsChangePctStats, schoolsChangePct, '', true)}
+                                            </div>
+                                        </div>
+                                    </td>
+                                </tr>
+                                <tr style="cursor: pointer;" onclick="toggleMetricDetails('playgrounds')">
+                                    <td><span id="icon-playgrounds">▶</span> 🛝 Accessible Playgrounds</td>
+                                    <td>${avgWithoutPlaygrounds.toFixed(1)} <span class="metric-unit">avg</span></td>
+                                    <td>${avgWithPlaygrounds.toFixed(1)} <span class="metric-unit">avg</span></td>
+                                    <td class="${playgroundsChangePct > 0 ? 'impact-positive' : playgroundsChangePct < 0 ? 'impact-negative' : 'impact-neutral'}">${playgroundsChangePct > 0 ? '+' : ''}${playgroundsChangePct.toFixed(1)} <span class="metric-unit">%</span></td>
+                                    <td class="${playgroundsSignificance.class}">
+                                        <div class="tooltip">
+                                            ${playgroundsSignificance.level}
+                                            <span class="tooltiptext">
+                                                <strong>${playgroundsSignificance.level} (${playgroundsRange}%)</strong><br>
+                                                ${playgroundsSignificance.description}
+                                            </span>
+                                        </div>
+                                    </td>
+                                </tr>
+                                <tr id="details-playgrounds" style="display: none;">
+                                    <td colspan="5" style="padding: 15px; background: #f8f9fa; border-left: 3px solid #007bff;">
+                                        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px;">
+                                            <div>
+                                                <strong>Without Park Distribution</strong>
+                                                ${createRangeBar(withoutPlaygroundsStats, avgWithoutPlaygrounds, ' count')}
+                                            </div>
+                                            <div>
+                                                <strong>With Park Distribution</strong>
+                                                ${createRangeBar(withPlaygroundsStats, avgWithPlaygrounds, ' count')}
+                                            </div>
+                                            <div>
+                                                <strong>Change Distribution</strong>
+                                                ${createRangeBar(playgroundsChangePctStats, playgroundsChangePct, '', true)}
+                                            </div>
+                                        </div>
+                                    </td>
+                                </tr>
+                                <tr style="cursor: pointer;" onclick="toggleMetricDetails('cafesbars')">
+                                    <td><span id="icon-cafesbars">▶</span> ☕ Accessible Cafes/Bars</td>
+                                    <td>${avgWithoutCafesBars.toFixed(1)} <span class="metric-unit">avg</span></td>
+                                    <td>${avgWithCafesBars.toFixed(1)} <span class="metric-unit">avg</span></td>
+                                    <td class="${cafesBarsChangePct > 0 ? 'impact-positive' : cafesBarsChangePct < 0 ? 'impact-negative' : 'impact-neutral'}">${cafesBarsChangePct > 0 ? '+' : ''}${cafesBarsChangePct.toFixed(1)} <span class="metric-unit">%</span></td>
+                                    <td class="${cafesBarsSignificance.class}">
+                                        <div class="tooltip">
+                                            ${cafesBarsSignificance.level}
+                                            <span class="tooltiptext">
+                                                <strong>${cafesBarsSignificance.level} (${cafesBarsRange}%)</strong><br>
+                                                ${cafesBarsSignificance.description}
+                                            </span>
+                                        </div>
+                                    </td>
+                                </tr>
+                                <tr id="details-cafesbars" style="display: none;">
+                                    <td colspan="5" style="padding: 15px; background: #f8f9fa; border-left: 3px solid #007bff;">
+                                        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px;">
+                                            <div>
+                                                <strong>Without Park Distribution</strong>
+                                                ${createRangeBar(withoutCafesBarsStats, avgWithoutCafesBars, ' count')}
+                                            </div>
+                                            <div>
+                                                <strong>With Park Distribution</strong>
+                                                ${createRangeBar(withCafesBarsStats, avgWithCafesBars, ' count')}
+                                            </div>
+                                            <div>
+                                                <strong>Change Distribution</strong>
+                                                ${createRangeBar(cafesBarsChangePctStats, cafesBarsChangePct, '', true)}
+                                            </div>
+                                        </div>
+                                    </td>
+                                </tr>
+                                <tr style="cursor: pointer;" onclick="toggleMetricDetails('transit')">
+                                    <td><span id="icon-transit">▶</span> 🚌 Accessible Transit Stops</td>
+                                    <td>${avgWithoutTransit.toFixed(1)} <span class="metric-unit">avg</span></td>
+                                    <td>${avgWithTransit.toFixed(1)} <span class="metric-unit">avg</span></td>
+                                    <td class="${transitChangePct > 0 ? 'impact-positive' : transitChangePct < 0 ? 'impact-negative' : 'impact-neutral'}">${transitChangePct > 0 ? '+' : ''}${transitChangePct.toFixed(1)} <span class="metric-unit">%</span></td>
+                                    <td class="${transitSignificance.class}">
+                                        <div class="tooltip">
+                                            ${transitSignificance.level}
+                                            <span class="tooltiptext">
+                                                <strong>${transitSignificance.level} (${transitRange}%)</strong><br>
+                                                ${transitSignificance.description}
+                                            </span>
+                                        </div>
+                                    </td>
+                                </tr>
+                                <tr id="details-transit" style="display: none;">
+                                    <td colspan="5" style="padding: 15px; background: #f8f9fa; border-left: 3px solid #007bff;">
+                                        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px;">
+                                            <div>
+                                                <strong>Without Park Distribution</strong>
+                                                ${createRangeBar(withoutTransitStats, avgWithoutTransit, ' count')}
+                                            </div>
+                                            <div>
+                                                <strong>With Park Distribution</strong>
+                                                ${createRangeBar(withTransitStats, avgWithTransit, ' count')}
+                                            </div>
+                                            <div>
+                                                <strong>Change Distribution</strong>
+                                                ${createRangeBar(transitChangePctStats, transitChangePct, '', true)}
+                                            </div>
+                                        </div>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
                 </div>
             `;
+            massOverviewElement.insertAdjacentHTML('afterend', averagedTableHTML);
+
 
             // Create interactive charts
             createMassAnalysisCharts(massResultsData, impactCounts);
 
-            // Determine overall park impact based on street network change
+            // Determine overall park impact based on street network change using significance levels
+            const streetNetworkSignificance = getSignificance(avgStreetNetworkChangePct);
             let parkImpactText = '';
             let parkImpactClass = '';
             
-            if (avgStreetNetworkChangePct < -5) {
-                parkImpactText = '🌟 <strong>HIGHLY BENEFICIAL</strong> - This park significantly improves street network accessibility by providing important pedestrian connections.';
-                parkImpactClass = 'success';
-            } else if (avgStreetNetworkChangePct < -1) {
-                parkImpactText = '✅ <strong>BENEFICIAL</strong> - This park generally improves street network accessibility with valuable pedestrian routes.';
-                parkImpactClass = 'success';
-            } else if (avgStreetNetworkChangePct > 5) {
-                parkImpactText = '⚠️ <strong>PROBLEMATIC</strong> - This park significantly blocks optimal street network access. Consider adding paths through or around it.';
-                parkImpactClass = 'error';
-            } else if (avgStreetNetworkChangePct > 1) {
-                parkImpactText = '🔶 <strong>MIXED IMPACT</strong> - This park has some negative impact on street network accessibility. Consider improving connectivity.';
-                parkImpactClass = 'loading';
-            } else {
-                parkImpactText = '➖ <strong>NEUTRAL</strong> - This park has minimal impact on overall street network accessibility.';
-                parkImpactClass = 'loading';
+            // Map significance levels to park impact descriptions
+            switch(streetNetworkSignificance.level) {
+                case 'Transformative':
+                    if (avgStreetNetworkChangePct > 0) {
+                        parkImpactText = '⚠️ <strong>HIGHLY PROBLEMATIC</strong> - This park creates major barriers to pedestrian movement, requiring significant detours.';
+                        parkImpactClass = 'error';
+                    } else {
+                        parkImpactText = '🌟 <strong>TRANSFORMATIVE</strong> - This park dramatically improves street network connectivity with crucial pedestrian routes.';
+                        parkImpactClass = 'success';
+                    }
+                    break;
+                case 'High':
+                    if (avgStreetNetworkChangePct > 0) {
+                        parkImpactText = '🔴 <strong>PROBLEMATIC</strong> - This park significantly blocks optimal pedestrian routes and reduces accessibility.';
+                        parkImpactClass = 'error';
+                    } else {
+                        parkImpactText = '🌟 <strong>HIGHLY BENEFICIAL</strong> - This park significantly improves street network accessibility with important connections.';
+                        parkImpactClass = 'success';
+                    }
+                    break;
+                case 'Strong':
+                    if (avgStreetNetworkChangePct > 0) {
+                        parkImpactText = '🔶 <strong>NEGATIVE IMPACT</strong> - This park noticeably reduces street network accessibility. Consider connectivity improvements.';
+                        parkImpactClass = 'loading';
+                    } else {
+                        parkImpactText = '✅ <strong>BENEFICIAL</strong> - This park provides valuable pedestrian connections that improve accessibility.';
+                        parkImpactClass = 'success';
+                    }
+                    break;
+                case 'Notable':
+                    if (avgStreetNetworkChangePct > 0) {
+                        parkImpactText = '🔶 <strong>MINOR NEGATIVE</strong> - This park has some negative impact on pedestrian accessibility.';
+                        parkImpactClass = 'loading';
+                    } else {
+                        parkImpactText = '✅ <strong>POSITIVE</strong> - This park modestly improves street network accessibility.';
+                        parkImpactClass = 'success';
+                    }
+                    break;
+                case 'Minimal':
+                    parkImpactText = '🔸 <strong>MINIMAL IMPACT</strong> - This park has very small effects on street network accessibility.';
+                    parkImpactClass = 'loading';
+                    break;
+                case 'No Change':
+                default:
+                    parkImpactText = '➖ <strong>NEUTRAL</strong> - This park has no measurable impact on street network accessibility.';
+                    parkImpactClass = 'loading';
+                    break;
             }
 
             document.getElementById('parkImpact').innerHTML = `
@@ -3571,7 +4011,7 @@ async def read_index():
                 if (chart) chart.destroy();
             });
 
-            // 1. Mass Comparison Chart - WITH vs WITHOUT areas and streets
+            // 1. Mass Comparison Chart - WITH vs WITHOUT areas across all nodes
             const massComparisonCtx = document.getElementById('massComparisonChart').getContext('2d');
             massCharts.massComparison = new Chart(massComparisonCtx, {
                 type: 'bar',
@@ -3582,29 +4022,13 @@ async def read_index():
                         data: data.map(d => d.with_area),
                         backgroundColor: 'rgba(40, 167, 69, 0.6)',
                         borderColor: 'rgba(40, 167, 69, 1)',
-                        borderWidth: 1,
-                        yAxisID: 'y'
-                    }, {
-                        label: 'WITH Park (Streets km)',
-                        data: data.map(d => d.with_street_length),
-                        backgroundColor: 'rgba(40, 167, 69, 0.8)',
-                        borderColor: 'rgba(40, 167, 69, 1)',
-                        borderWidth: 1,
-                        yAxisID: 'y1'
+                        borderWidth: 1
                     }, {
                         label: 'WITHOUT Park (Area km²)',
                         data: data.map(d => d.without_area),
                         backgroundColor: 'rgba(220, 53, 69, 0.6)',
                         borderColor: 'rgba(220, 53, 69, 1)',
-                        borderWidth: 1,
-                        yAxisID: 'y'
-                    }, {
-                        label: 'WITHOUT Park (Streets km)',
-                        data: data.map(d => d.without_street_length),
-                        backgroundColor: 'rgba(220, 53, 69, 0.8)',
-                        borderColor: 'rgba(220, 53, 69, 1)',
-                        borderWidth: 1,
-                        yAxisID: 'y1'
+                        borderWidth: 1
                     }]
                 },
                 options: {
@@ -3615,111 +4039,20 @@ async def read_index():
                         intersect: false,
                     },
                     plugins: {
-                        title: { display: true, text: 'Area & Street Network Comparison Across All Nodes' },
+                        title: { display: true, text: 'Area Comparison Across All Nodes' },
                         legend: { position: 'top' }
                     },
                     scales: {
                         x: { title: { display: true, text: 'Analysis Points' } },
                         y: {
-                            type: 'linear',
-                            display: true,
-                            position: 'left',
                             title: { display: true, text: 'Area (km²)' },
                             beginAtZero: true
-                        },
-                        y1: {
-                            type: 'linear',
-                            display: true,
-                            position: 'right',
-                            title: { display: true, text: 'Street Length (km)' },
-                            beginAtZero: true,
-                            grid: {
-                                drawOnChartArea: false,
-                            },
                         }
                     }
                 }
             });
 
-            // 2. Impact Distribution Histogram - based on street network changes
-            const impactDistCtx = document.getElementById('impactDistributionChart').getContext('2d');
-            const impactBuckets = [-10, -5, -1, 0, 1, 5, 10];
-            const bucketCounts = new Array(impactBuckets.length - 1).fill(0);
-            
-            data.forEach(d => {
-                for (let i = 0; i < impactBuckets.length - 1; i++) {
-                    if (d.street_network_change_pct >= impactBuckets[i] && d.street_network_change_pct < impactBuckets[i + 1]) {
-                        bucketCounts[i]++;
-                        break;
-                    }
-                }
-            });
-
-            massCharts.impactDistribution = new Chart(impactDistCtx, {
-                type: 'bar',
-                data: {
-                    labels: ['-10% to -5%', '-5% to -1%', '-1% to 0%', '0% to 1%', '1% to 5%', '5% to 10%'],
-                    datasets: [{
-                        label: 'Number of Nodes',
-                        data: bucketCounts,
-                        backgroundColor: bucketCounts.map((_, i) => {
-                            if (i < 2) return 'rgba(40, 167, 69, 0.8)';  // Positive impact
-                            if (i === 2 || i === 3) return 'rgba(108, 117, 125, 0.8)';  // Neutral
-                            return 'rgba(220, 53, 69, 0.8)';  // Negative impact
-                        })
-                    }]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: {
-                        title: { display: true, text: 'Street Network Impact Distribution' },
-                        legend: { display: false }
-                    },
-                    scales: {
-                        y: { beginAtZero: true, title: { display: true, text: 'Number of Nodes' } },
-                        x: { title: { display: true, text: 'Street Network Change (%)' } }
-                    }
-                }
-            });
-
-            // 3. Scatter Plot - Street Length vs Street Network Impact
-            const scatterCtx = document.getElementById('scatterPlotChart').getContext('2d');
-            massCharts.scatter = new Chart(scatterCtx, {
-                type: 'scatter',
-                data: {
-                    datasets: [{
-                        label: 'Street Network Impact vs Street Length',
-                        data: data.map(d => ({ x: d.with_street_length, y: d.street_network_change_pct })),
-                        backgroundColor: data.map(d => {
-                            switch(d.impact_category) {
-                                case 'highly_positive': return 'rgba(40, 167, 69, 0.8)';
-                                case 'positive': return 'rgba(111, 156, 61, 0.8)';
-                                case 'neutral': return 'rgba(108, 117, 125, 0.8)';
-                                case 'negative': return 'rgba(220, 53, 69, 0.8)';
-                                case 'highly_negative': return 'rgba(167, 29, 42, 0.8)';
-                                default: return 'rgba(0, 123, 255, 0.8)';
-                            }
-                        }),
-                        pointRadius: 6,
-                        pointHoverRadius: 8
-                    }]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: {
-                        title: { display: true, text: 'Street Network Impact vs Baseline Street Length' },
-                        legend: { display: false }
-                    },
-                    scales: {
-                        x: { title: { display: true, text: 'WITH Park Street Length (km)' } },
-                        y: { title: { display: true, text: 'Street Network Impact (% Change)' } }
-                    }
-                }
-            });
-
-            // 4. Impact Categories Pie Chart
+            // 2. Impact Categories Pie Chart
             const categoriesCtx = document.getElementById('impactCategoriesChart').getContext('2d');
             massCharts.categories = new Chart(categoriesCtx, {
                 type: 'doughnut',
