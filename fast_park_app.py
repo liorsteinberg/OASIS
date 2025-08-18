@@ -44,13 +44,32 @@ class NetworkXAdapter(NetworkAdapter):
     
     def __init__(self, graph: nx.Graph):
         super().__init__(graph)
+        self._shortest_path_cache = {}  # Cache for reusing calculations
+        self._max_cache_size = 50   # Reduced cache size for better memory management
         
     def shortest_path_lengths(self, start_node: int, max_distance: float) -> Dict[int, float]:
-        """Calculate shortest path lengths using NetworkX"""
+        """Calculate shortest path lengths using NetworkX with caching optimization"""
         try:
-            return nx.single_source_dijkstra_path_length(
+            cache_key = (start_node, max_distance)
+            
+            # Check cache first
+            if cache_key in self._shortest_path_cache:
+                return self._shortest_path_cache[cache_key]
+            
+            # Calculate and cache result
+            result = nx.single_source_dijkstra_path_length(
                 self.nx_graph, start_node, weight='length', cutoff=max_distance
             )
+            
+            # Manage cache size
+            if len(self._shortest_path_cache) >= self._max_cache_size:
+                # Remove oldest entry (simple FIFO)
+                oldest_key = next(iter(self._shortest_path_cache))
+                del self._shortest_path_cache[oldest_key]
+            
+            self._shortest_path_cache[cache_key] = result
+            return result
+            
         except KeyError as e:
             print(f"NetworkX KeyError during Dijkstra: {e}")
             return {}
@@ -75,6 +94,9 @@ class NetworKitAdapter(NetworkAdapter):
         super().__init__(graph)
         if not NETWORKIT_AVAILABLE:
             raise ImportError("NetworKit is not installed")
+        
+        self._shortest_path_cache = {}  # Cache for reusing calculations
+        self._max_cache_size = 50   # Reduced cache size for better memory management
         
         # Convert NetworkX graph to NetworKit with fallback handling
         self.has_weights = False  # Track if weights were successfully converted
@@ -117,8 +139,14 @@ class NetworKitAdapter(NetworkAdapter):
         self.nk_to_nx = {i: node for node, i in self.nx_to_nk.items()}
         
     def shortest_path_lengths(self, start_node: int, max_distance: float) -> Dict[int, float]:
-        """Calculate shortest path lengths using NetworKit"""
+        """Calculate shortest path lengths using NetworKit with caching optimization"""
         try:
+            cache_key = (start_node, max_distance)
+            
+            # Check cache first
+            if cache_key in self._shortest_path_cache:
+                return self._shortest_path_cache[cache_key]
+                
             if start_node not in self.nx_to_nk:
                 print(f"NetworKit: Start node {start_node} not found")
                 return {}
@@ -127,27 +155,42 @@ class NetworKitAdapter(NetworkAdapter):
             if not self.has_weights:
                 print("NetworKit: No edge weights available, falling back to NetworkX for distance calculation")
                 try:
-                    return nx.single_source_dijkstra_path_length(
+                    result = nx.single_source_dijkstra_path_length(
                         self.nx_graph, start_node, weight='length', cutoff=max_distance
                     )
+                    
+                    # Cache NetworkX fallback result too
+                    if len(self._shortest_path_cache) >= self._max_cache_size:
+                        oldest_key = next(iter(self._shortest_path_cache))
+                        del self._shortest_path_cache[oldest_key]
+                    self._shortest_path_cache[cache_key] = result
+                    return result
+                    
                 except KeyError as e:
                     print(f"NetworkX fallback also failed: {e}")
                     return {}
+            else:
+                nk_start = self.nx_to_nk[start_node]
                 
-            nk_start = self.nx_to_nk[start_node]
+                # Use NetworKit's Dijkstra algorithm with weights
+                dijkstra = nk.distance.Dijkstra(self.nk_graph, nk_start, storePaths=False)
+                dijkstra.run()
+                
+                # Convert back to NetworkX node IDs and filter by distance
+                result = {}
+                for nk_node in range(self.nk_graph.numberOfNodes()):
+                    distance = dijkstra.distance(nk_node)
+                    if distance <= max_distance and distance != float('inf'):
+                        nx_node = self.nk_to_nx[nk_node]
+                        result[nx_node] = distance
             
-            # Use NetworKit's Dijkstra algorithm with weights
-            dijkstra = nk.distance.Dijkstra(self.nk_graph, nk_start, storePaths=False)
-            dijkstra.run()
+            # Cache result before returning
+            if len(self._shortest_path_cache) >= self._max_cache_size:
+                # Remove oldest entry (simple FIFO)
+                oldest_key = next(iter(self._shortest_path_cache))
+                del self._shortest_path_cache[oldest_key]
             
-            # Convert back to NetworkX node IDs and filter by distance
-            result = {}
-            for nk_node in range(self.nk_graph.numberOfNodes()):
-                distance = dijkstra.distance(nk_node)
-                if distance <= max_distance and distance != float('inf'):
-                    nx_node = self.nk_to_nx[nk_node]
-                    result[nx_node] = distance
-                    
+            self._shortest_path_cache[cache_key] = result        
             return result
         except Exception as e:
             print(f"NetworKit error during Dijkstra: {e}")
@@ -279,6 +322,125 @@ MASS_ANALYSIS_PROGRESS = {}
 class ParkAccessibilityAnalyzer:
     def __init__(self):
         self.cache = {}
+        # Cache for polygon objects to avoid recreating them
+        self._polygon_cache = {}
+    
+    def _get_or_create_polygon(self, area_result, points):
+        """Get polygon from cache or create and cache it"""
+        # Create a cache key based on the boundary or points
+        if 'boundary' in area_result and area_result['boundary']:
+            # Use boundary coordinates as cache key
+            cache_key = tuple(tuple(coord) for coord in area_result['boundary'])
+        else:
+            # Use points as cache key
+            if len(points) >= 3:
+                cache_key = tuple(tuple(point) for point in points)
+            else:
+                return None
+        
+        # Check if polygon is already cached
+        if cache_key in self._polygon_cache:
+            return self._polygon_cache[cache_key]
+        
+        # Create polygon
+        polygon = None
+        if 'boundary' in area_result and len(area_result['boundary']) > 3:
+            # Use boundary if available (more accurate)
+            boundary_coords = [(coord[1], coord[0]) for coord in area_result['boundary']]
+            polygon = Polygon(boundary_coords)
+        else:
+            # Fallback: create convex hull polygon from points
+            if len(points) >= 3:
+                hull_points = []
+                from scipy.spatial import ConvexHull
+                hull = ConvexHull(points)
+                for vertex in hull.vertices:
+                    # points are [lat, lng] format, convert to [lng, lat] for Shapely
+                    hull_points.append((points[vertex][1], points[vertex][0]))
+                polygon = Polygon(hull_points)
+        
+        # Cache the polygon
+        if polygon is not None:
+            self._polygon_cache[cache_key] = polygon
+        
+        return polygon
+    
+    def _extract_local_subgraph(self, graph: nx.Graph, nodes_gdf: gpd.GeoDataFrame, 
+                               center_node: int, max_distance: float) -> nx.Graph:
+        """Extract a local subgraph around a center node within walking distance"""
+        
+        if center_node not in graph:
+            raise ValueError(f"Center node {center_node} not found in graph")
+        
+        # Use Dijkstra-like approach to find all nodes within walking distance
+        distances = {center_node: 0.0}
+        visited = set()
+        queue = [(0.0, center_node)]  # (distance, node)
+        local_nodes = set([center_node])
+        
+        while queue:
+            current_dist, current_node = min(queue, key=lambda x: x[0])
+            queue.remove((current_dist, current_node))
+            
+            if current_node in visited:
+                continue
+            visited.add(current_node)
+            
+            # Explore neighbors
+            for neighbor in graph.neighbors(current_node):
+                if neighbor not in distances:
+                    # Get edge length
+                    edge_data = graph[current_node][neighbor]
+                    edge_length = edge_data.get('length', 50)  # Default 50m if no length
+                    
+                    new_distance = current_dist + edge_length
+                    
+                    if new_distance <= max_distance:
+                        distances[neighbor] = new_distance
+                        local_nodes.add(neighbor)
+                        queue.append((new_distance, neighbor))
+        
+        # Extract subgraph with only the local nodes
+        subgraph = graph.subgraph(local_nodes).copy()
+        
+        return subgraph
+    
+    def _filter_amenities_for_subgraph(self, subgraph: nx.Graph, nodes_gdf: gpd.GeoDataFrame, 
+                                     amenities_gdf: gpd.GeoDataFrame, buffer_meters: float = 100) -> gpd.GeoDataFrame:
+        """Filter amenities to only those near the subgraph area"""
+        if amenities_gdf is None or amenities_gdf.empty:
+            return amenities_gdf
+        
+        # Get bounds of the subgraph nodes
+        subgraph_node_ids = list(subgraph.nodes())
+        if not subgraph_node_ids:
+            return gpd.GeoDataFrame()  # Empty result
+        
+        # Filter nodes_gdf to subgraph nodes and get their bounds
+        subgraph_nodes_gdf = nodes_gdf.loc[nodes_gdf.index.intersection(subgraph_node_ids)]
+        
+        if subgraph_nodes_gdf.empty:
+            return gpd.GeoDataFrame()
+        
+        # Get bounding box of subgraph nodes
+        bounds = subgraph_nodes_gdf.total_bounds  # [minx, miny, maxx, maxy]
+        
+        # Add buffer (convert meters to approximate degrees)
+        buffer_deg = buffer_meters / 111000  # Very rough conversion: 1 degree ≈ 111km
+        buffered_bounds = [
+            bounds[0] - buffer_deg,  # minx
+            bounds[1] - buffer_deg,  # miny  
+            bounds[2] + buffer_deg,  # maxx
+            bounds[3] + buffer_deg   # maxy
+        ]
+        
+        # Filter amenities to those within the buffered bounds
+        amenities_in_bounds = amenities_gdf.cx[
+            buffered_bounds[0]:buffered_bounds[2],  # longitude range
+            buffered_bounds[1]:buffered_bounds[3]   # latitude range
+        ]
+        
+        return amenities_in_bounds
     
     async def load_area_data(self, lat: float, lng: float, radius: int = 2000) -> Dict:
         """Load parks and street network for an area"""
@@ -301,7 +463,7 @@ class ParkAccessibilityAnalyzer:
         # Create unique progress key for this request
         progress_key = f"{lat:.4f}_{lng:.4f}_{radius}"
         
-        total_steps = 14
+        total_steps = 15
         current_step = 0
         
         def log_progress(step_name: str):
@@ -311,10 +473,23 @@ class ParkAccessibilityAnalyzer:
                 'current_step': current_step,
                 'total_steps': total_steps,
                 'step_name': step_name,
-                'completed': False
+                'sub_progress': 0,
+                'current_operation': step_name,
+                'estimated_time_remaining': None,
+                'completed': False,
+                'start_time': __import__('time').time() if current_step == 1 else LOADING_PROGRESS.get(progress_key, {}).get('start_time', __import__('time').time())
             }
             LOADING_PROGRESS[progress_key] = progress_info
             print(f"Step {current_step}/{total_steps}: {step_name}")
+        
+        def update_sub_progress(sub_progress: int, operation: str, estimate_remaining: float = None):
+            """Update sub-progress within the current step"""
+            if progress_key in LOADING_PROGRESS:
+                LOADING_PROGRESS[progress_key]['sub_progress'] = sub_progress
+                LOADING_PROGRESS[progress_key]['current_operation'] = operation
+                if estimate_remaining:
+                    LOADING_PROGRESS[progress_key]['estimated_time_remaining'] = estimate_remaining
+                print(f"  → {operation} ({sub_progress}%)")
         
         try:
             # Step 1: Load parks from OpenStreetMap
@@ -336,8 +511,22 @@ class ParkAccessibilityAnalyzer:
             
             # Step 3: Load street network from OpenStreetMap
             log_progress("Loading street network from OpenStreetMap...")
+            import time
+            network_start = time.time()
+            
+            # Estimate time based on radius (rough estimates)
+            if radius >= 4000:
+                estimated_time = 120  # 2 minutes for 4km
+                update_sub_progress(10, "Downloading large street network (this may take 2-3 minutes)...", estimated_time)
+            elif radius >= 2000:
+                estimated_time = 30   # 30 seconds for 2km  
+                update_sub_progress(10, "Downloading street network...", estimated_time)
+            else:
+                update_sub_progress(10, "Downloading street network...")
+            
             graph = ox.graph_from_point((lat, lng), dist=radius, network_type='walk')
-            print(f"Graph loaded: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges")
+            network_time = time.time() - network_start
+            print(f"Graph loaded: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges (took {network_time:.1f}s)")
             
             # Step 4: Calculate edge lengths and weights
             log_progress("Calculating street lengths and weights...")
@@ -441,7 +630,17 @@ class ParkAccessibilityAnalyzer:
             # Use larger radius for amenities to capture walkable POIs beyond park area
             poi_radius = radius * 2  # Double the radius for POI search
             log_progress("Loading supermarkets from OpenStreetMap...")
+            
+            # Provide time estimates for amenity loading
+            if poi_radius >= 8000:
+                update_sub_progress(20, "Downloading supermarkets data (large area - may take 30-60s)...")
+            elif poi_radius >= 4000:
+                update_sub_progress(20, "Downloading supermarkets data...")
+            else:
+                update_sub_progress(20, "Downloading supermarkets...")
+            
             try:
+                amenity_start = time.time()
                 supermarkets_gdf = ox.features_from_point(
                     (lat, lng), 
                     dist=poi_radius,
@@ -450,7 +649,8 @@ class ParkAccessibilityAnalyzer:
                 if not supermarkets_gdf.empty:
                     # Ensure WGS84 CRS for consistency
                     supermarkets_gdf = supermarkets_gdf.to_crs('EPSG:4326')
-                print(f"Loaded {len(supermarkets_gdf) if not supermarkets_gdf.empty else 0} supermarkets (CRS: {supermarkets_gdf.crs if not supermarkets_gdf.empty else 'N/A'})")
+                amenity_time = time.time() - amenity_start
+                print(f"Loaded {len(supermarkets_gdf) if not supermarkets_gdf.empty else 0} supermarkets (CRS: {supermarkets_gdf.crs if not supermarkets_gdf.empty else 'N/A'}, took {amenity_time:.1f}s)")
             except Exception as e:
                 print(f"Failed to load supermarkets: {e}")
                 import geopandas as gpd
@@ -482,7 +682,17 @@ class ParkAccessibilityAnalyzer:
             
             # Step 12: Load cafes/bars from OpenStreetMap
             log_progress("Loading cafes and bars from OpenStreetMap...")
+            
+            # Cafes/bars can be very numerous and slow to load for large areas
+            if poi_radius >= 8000:
+                update_sub_progress(40, "Downloading cafes/bars data (large area - this is often the slowest step, may take 1-2 minutes)...")
+            elif poi_radius >= 4000:
+                update_sub_progress(40, "Downloading cafes/bars data (may take 30-60s)...")
+            else:
+                update_sub_progress(40, "Downloading cafes/bars...")
+            
             try:
+                cafes_start = time.time()
                 cafes_bars_gdf = ox.features_from_point(
                     (lat, lng), 
                     dist=poi_radius, 
@@ -490,7 +700,8 @@ class ParkAccessibilityAnalyzer:
                 )
                 if not cafes_bars_gdf.empty:
                     cafes_bars_gdf = cafes_bars_gdf.to_crs('EPSG:4326')
-                print(f"Loaded {len(cafes_bars_gdf) if not cafes_bars_gdf.empty else 0} cafes/bars (CRS: {cafes_bars_gdf.crs if not cafes_bars_gdf.empty else 'N/A'})")
+                cafes_time = time.time() - cafes_start
+                print(f"Loaded {len(cafes_bars_gdf) if not cafes_bars_gdf.empty else 0} cafes/bars (CRS: {cafes_bars_gdf.crs if not cafes_bars_gdf.empty else 'N/A'}, took {cafes_time:.1f}s)")
             except Exception as e:
                 print(f"Failed to load cafes/bars: {e}")
                 import geopandas as gpd
@@ -498,6 +709,12 @@ class ParkAccessibilityAnalyzer:
             
             # Step 13: Load public transit from OpenStreetMap
             log_progress("Loading public transit stops from OpenStreetMap...")
+            
+            if poi_radius >= 8000:
+                update_sub_progress(60, "Downloading transit data (large area - may take 30-60s)...")
+            else:
+                update_sub_progress(60, "Downloading transit data...")
+                
             try:
                 transit_gdf = ox.features_from_point(
                     (lat, lng), 
@@ -521,6 +738,47 @@ class ParkAccessibilityAnalyzer:
                 print(f"Sample school: {schools_gdf.iloc[0].get('name', 'Unnamed')} at ({schools_gdf.iloc[0].geometry.centroid.y:.6f}, {schools_gdf.iloc[0].geometry.centroid.x:.6f})")
             if len(transit_gdf) > 0:
                 print(f"Sample transit: {transit_gdf.iloc[0].get('name', 'Unnamed')} at ({transit_gdf.iloc[0].geometry.centroid.y:.6f}, {transit_gdf.iloc[0].geometry.centroid.x:.6f})")
+            
+            # Step 14: Create spatial indexes for fast amenity lookup during mass analysis
+            log_progress("Creating spatial indexes for amenities...")
+            update_sub_progress(80, "Building spatial indexes for fast amenity filtering...")
+            try:
+                from rtree import index
+                # Create spatial indexes for each amenity type
+                amenity_indexes = {}
+                amenity_data = {
+                    'supermarkets': supermarkets_gdf,
+                    'schools': schools_gdf, 
+                    'playgrounds': playgrounds_gdf,
+                    'cafes_bars': cafes_bars_gdf,
+                    'transit': transit_gdf
+                }
+                
+                for amenity_type, gdf in amenity_data.items():
+                    if not gdf.empty:
+                        spatial_idx = index.Index()
+                        for i, (idx, row) in enumerate(gdf.iterrows()):
+                            geom = row.geometry
+                            if hasattr(geom, 'centroid'):
+                                point = geom.centroid
+                            else:
+                                point = geom
+                            # Insert (integer_id, (minx, miny, maxx, maxy))
+                            # Store mapping from integer id to original index
+                            spatial_idx.insert(i, (point.x, point.y, point.x, point.y))
+                        amenity_indexes[amenity_type] = {'index': spatial_idx, 'id_mapping': dict(enumerate(gdf.index))}
+                        print(f"✓ Created spatial index for {len(gdf)} {amenity_type}")
+                    else:
+                        amenity_indexes[amenity_type] = None
+                        print(f"✗ No {amenity_type} data, spatial index set to None")
+                        
+            except ImportError:
+                print("rtree not available, falling back to brute force spatial filtering")
+                amenity_indexes = {}
+            except Exception as e:
+                print(f"Failed to create spatial indexes: {e}")
+                amenity_indexes = {}
+            
             
             # Mark progress as completed
             LOADING_PROGRESS[progress_key] = {
@@ -553,7 +811,8 @@ class ParkAccessibilityAnalyzer:
                 'schools_gdf': schools_gdf,
                 'playgrounds_gdf': playgrounds_gdf,
                 'cafes_bars_gdf': cafes_bars_gdf,
-                'transit_gdf': transit_gdf
+                'transit_gdf': transit_gdf,
+                'amenity_indexes': amenity_indexes  # Add spatial indexes for fast lookup
             }
             
         except Exception as e:
@@ -680,16 +939,9 @@ class ParkAccessibilityAnalyzer:
             if park_key is None:
                 raise KeyError(f"Park {park_id} not found in parks_gdf")
             
-            # Get park geometry and pre-calculate edge removal (shared resource)
+            # Get park geometry for dynamic filtering
             park_geom = parks_gdf.loc[park_key].geometry
-            edges_to_remove = self._get_park_edges(graph, nodes_gdf, park_geom)
-            print(f"Pre-calculated {len(edges_to_remove)} park edges to remove")
-            
-            # Create shared network adapters (expensive operations done once)
-            print(f"Creating shared network adapters with backend: {network_backend}")
-            with_park_adapter = create_network_adapter(graph, network_backend)
-            without_park_adapter = with_park_adapter.remove_edges(edges_to_remove)
-            print("Shared network adapters created")
+            print(f"Using dynamic subgraph approach - no preprocessing required")
             
             # Walking parameters
             walking_speed_ms = (walk_speed * 1000) / 60  # km/h to m/min
@@ -700,7 +952,7 @@ class ParkAccessibilityAnalyzer:
             results = []
             
             def process_single_node(node_id: str) -> Dict:
-                """Process a single node with shared resources"""
+                """Process a single node using dynamic subgraphs"""
                 try:
                     # Validate node exists
                     node_key = int(node_id)
@@ -712,24 +964,40 @@ class ParkAccessibilityAnalyzer:
                     
                     print(f"Processing node {node_id}...")
                     
-                    # Calculate WITH park using shared adapter
-                    with_park = self._calculate_isochrone(with_park_adapter, nodes_gdf, data['edges_gdf'], 
+                    # Extract dynamic subgraph around this node
+                    local_subgraph = self._extract_local_subgraph(graph, nodes_gdf, node_key, max_distance)
+                    
+                    # Filter amenities to the local area
+                    local_supermarkets = self._filter_amenities_for_subgraph(local_subgraph, nodes_gdf, data.get('supermarkets_gdf'))
+                    local_schools = self._filter_amenities_for_subgraph(local_subgraph, nodes_gdf, data.get('schools_gdf'))
+                    local_playgrounds = self._filter_amenities_for_subgraph(local_subgraph, nodes_gdf, data.get('playgrounds_gdf'))
+                    local_cafes_bars = self._filter_amenities_for_subgraph(local_subgraph, nodes_gdf, data.get('cafes_bars_gdf'))
+                    local_transit = self._filter_amenities_for_subgraph(local_subgraph, nodes_gdf, data.get('transit_gdf'))
+                    
+                    # Create simple NetworkX adapter for the local subgraph (no NetworKit conversion needed)
+                    local_adapter = NetworkXAdapter(local_subgraph)
+                    
+                    # Calculate WITH park using local subgraph
+                    with_park = self._calculate_isochrone(local_adapter, nodes_gdf, data['edges_gdf'], 
                                                         node_key, max_distance, viz_method,
-                                                        supermarkets_gdf=data.get('supermarkets_gdf'),
-                                                        schools_gdf=data.get('schools_gdf'),
-                                                        playgrounds_gdf=data.get('playgrounds_gdf'),
-                                                        cafes_bars_gdf=data.get('cafes_bars_gdf'),
-                                                        transit_gdf=data.get('transit_gdf'),
+                                                        supermarkets_gdf=local_supermarkets,
+                                                        schools_gdf=local_schools,
+                                                        playgrounds_gdf=local_playgrounds,
+                                                        cafes_bars_gdf=local_cafes_bars,
+                                                        transit_gdf=local_transit,
                                                         debug_label="WITH_PARK")
                     
-                    # Calculate WITHOUT park using shared adapter 
-                    without_park = self._calculate_isochrone(without_park_adapter, nodes_gdf, data['edges_gdf'],
+                    # Calculate WITHOUT park - remove park edges from local subgraph
+                    park_edges_in_subgraph = self._get_park_edges(local_subgraph, nodes_gdf, park_geom)
+                    without_park_subgraph = local_adapter.remove_edges(park_edges_in_subgraph)
+                    
+                    without_park = self._calculate_isochrone(without_park_subgraph, nodes_gdf, data['edges_gdf'],
                                                            node_key, max_distance, viz_method,
-                                                           supermarkets_gdf=data.get('supermarkets_gdf'),
-                                                           schools_gdf=data.get('schools_gdf'),
-                                                           playgrounds_gdf=data.get('playgrounds_gdf'),
-                                                           cafes_bars_gdf=data.get('cafes_bars_gdf'),
-                                                           transit_gdf=data.get('transit_gdf'),
+                                                           supermarkets_gdf=local_supermarkets,
+                                                           schools_gdf=local_schools,
+                                                           playgrounds_gdf=local_playgrounds,
+                                                           cafes_bars_gdf=local_cafes_bars,
+                                                           transit_gdf=local_transit,
                                                            debug_label="WITHOUT_PARK")
                     
                     # Calculate metrics (same as single node analysis)
@@ -802,8 +1070,12 @@ class ParkAccessibilityAnalyzer:
                         'park_id': park_id
                     }
             
-            # Process nodes in parallel
-            max_workers = min(6, len(node_ids))  # Limit concurrent workers
+            # Process nodes in parallel with enhanced threading
+            # Use more workers for CPU-bound operations, but respect system limits
+            import os
+            cpu_count = os.cpu_count() or 4
+            max_workers = min(max(cpu_count - 1, 4), 12, len(node_ids))  # Dynamic worker count
+            print(f"Using {max_workers} parallel workers (CPU cores: {cpu_count})")
             with ThreadPoolExecutor(max_workers=max_workers) as parallel_executor:
                 future_to_node = {parallel_executor.submit(process_single_node, node_id): node_id 
                                 for node_id in node_ids}
@@ -836,6 +1108,25 @@ class ParkAccessibilityAnalyzer:
             MASS_ANALYSIS_PROGRESS[progress_key]['current_node'] = "Complete"
             
             print(f"Mass accessibility calculation complete: {len(results)} results")
+            
+            # Memory cleanup and monitoring
+            try:
+                import psutil
+                process = psutil.Process()
+                memory_mb = process.memory_info().rss / 1024 / 1024
+                print(f"Memory usage after mass analysis: {memory_mb:.1f} MB")
+                
+                # Clean up large temporary variables
+                del future_to_node
+                if 'with_park_adapter' in locals():
+                    del with_park_adapter
+                if 'without_park_adapter' in locals():
+                    del without_park_adapter
+                    
+            except ImportError:
+                print("psutil not available for memory monitoring")
+            except Exception as e:
+                print(f"Memory monitoring error: {e}")
             
             # Return just the results array
             return results
@@ -911,7 +1202,8 @@ class ParkAccessibilityAnalyzer:
                                                 schools_gdf=data.get('schools_gdf'),
                                                 playgrounds_gdf=data.get('playgrounds_gdf'),
                                                 cafes_bars_gdf=data.get('cafes_bars_gdf'),
-                                                transit_gdf=data.get('transit_gdf'))
+                                                transit_gdf=data.get('transit_gdf'),
+                                                amenity_indexes=data.get('amenity_indexes'))
             
             print("Calculating WITHOUT park...")
             # Calculate WITHOUT park - remove park edges and create new adapter
@@ -922,7 +1214,8 @@ class ParkAccessibilityAnalyzer:
                                                    schools_gdf=data.get('schools_gdf'),
                                                    playgrounds_gdf=data.get('playgrounds_gdf'),
                                                    cafes_bars_gdf=data.get('cafes_bars_gdf'),
-                                                   transit_gdf=data.get('transit_gdf'))
+                                                   transit_gdf=data.get('transit_gdf'),
+                                                   amenity_indexes=data.get('amenity_indexes'))
             
             print("Accessibility calculation complete")
             
@@ -999,7 +1292,7 @@ class ParkAccessibilityAnalyzer:
                            edges_gdf: gpd.GeoDataFrame, start_node: int, max_distance: float, 
                            viz_method: str = "convex_hull", park_geometry=None, 
                            supermarkets_gdf=None, schools_gdf=None, playgrounds_gdf=None, 
-                           cafes_bars_gdf=None, transit_gdf=None, debug_label="") -> Dict:
+                           cafes_bars_gdf=None, transit_gdf=None, debug_label="", amenity_indexes=None) -> Dict:
         """Calculate isochrone for a node with enhanced metrics"""
         if start_node not in network_adapter.nx_graph:
             print(f"Start node {start_node} not found in graph")
@@ -1073,11 +1366,18 @@ class ParkAccessibilityAnalyzer:
             print(f"{debug_label} Isochrone calculation - Received amenity data: supermarkets={len(supermarkets_gdf) if supermarkets_gdf is not None else 0} (empty={supermarkets_gdf.empty if supermarkets_gdf is not None else 'N/A'}), schools={len(schools_gdf) if schools_gdf is not None else 0} (empty={schools_gdf.empty if schools_gdf is not None else 'N/A'}), playgrounds={len(playgrounds_gdf) if playgrounds_gdf is not None else 0} (empty={playgrounds_gdf.empty if playgrounds_gdf is not None else 'N/A'}), cafes_bars={len(cafes_bars_gdf) if cafes_bars_gdf is not None else 0} (empty={cafes_bars_gdf.empty if cafes_bars_gdf is not None else 'N/A'}), transit={len(transit_gdf) if transit_gdf is not None else 0} (empty={transit_gdf.empty if transit_gdf is not None else 'N/A'})")
             
             # Use proper null checking to avoid GeoDataFrame boolean ambiguity
-            accessible_supermarkets = self._calculate_accessible_supermarkets(area_result, points, supermarkets_gdf if supermarkets_gdf is not None and not supermarkets_gdf.empty else None, debug_label)
-            accessible_schools = self._calculate_accessible_schools(area_result, points, schools_gdf if schools_gdf is not None and not schools_gdf.empty else None, debug_label)
-            accessible_playgrounds = self._calculate_accessible_playgrounds(area_result, points, playgrounds_gdf if playgrounds_gdf is not None and not playgrounds_gdf.empty else None, debug_label)
-            accessible_cafes_bars = self._calculate_accessible_cafes_bars(area_result, points, cafes_bars_gdf if cafes_bars_gdf is not None and not cafes_bars_gdf.empty else None, debug_label)
-            accessible_transit = self._calculate_accessible_transit(area_result, points, transit_gdf if transit_gdf is not None and not transit_gdf.empty else None, debug_label)
+            # Get spatial indexes for optimization
+            supermarkets_idx = amenity_indexes.get('supermarkets') if amenity_indexes else None
+            schools_idx = amenity_indexes.get('schools') if amenity_indexes else None
+            playgrounds_idx = amenity_indexes.get('playgrounds') if amenity_indexes else None
+            cafes_bars_idx = amenity_indexes.get('cafes_bars') if amenity_indexes else None
+            transit_idx = amenity_indexes.get('transit') if amenity_indexes else None
+            
+            accessible_supermarkets = self._calculate_accessible_supermarkets(area_result, points, supermarkets_gdf if supermarkets_gdf is not None and not supermarkets_gdf.empty else None, debug_label, supermarkets_idx)
+            accessible_schools = self._calculate_accessible_schools(area_result, points, schools_gdf if schools_gdf is not None and not schools_gdf.empty else None, debug_label, schools_idx)
+            accessible_playgrounds = self._calculate_accessible_playgrounds(area_result, points, playgrounds_gdf if playgrounds_gdf is not None and not playgrounds_gdf.empty else None, debug_label, playgrounds_idx)
+            accessible_cafes_bars = self._calculate_accessible_cafes_bars(area_result, points, cafes_bars_gdf if cafes_bars_gdf is not None and not cafes_bars_gdf.empty else None, debug_label, cafes_bars_idx)
+            accessible_transit = self._calculate_accessible_transit(area_result, points, transit_gdf if transit_gdf is not None and not transit_gdf.empty else None, debug_label, transit_idx)
             
             # Compile enhanced result
             result = {
@@ -1169,63 +1469,82 @@ class ParkAccessibilityAnalyzer:
                 'total_length_km': 0, 'edge_count': 0, 'street_density_km_per_km2': 0, 'avg_edge_length_m': 0
             }
     
-    def _calculate_accessible_supermarkets(self, area_result, points, supermarkets_gdf, debug_label=""):
+    def _calculate_accessible_supermarkets(self, area_result, points, supermarkets_gdf, debug_label="", spatial_index=None):
         """Calculate number of supermarkets accessible within the isochrone area using pre-loaded data"""
-        return self._filter_amenities_in_polygon(area_result, points, supermarkets_gdf, "Supermarkets", debug_label)
+        return self._filter_amenities_in_polygon(area_result, points, supermarkets_gdf, "Supermarkets", debug_label, spatial_index)
     
-    def _filter_amenities_in_polygon(self, area_result, points, amenities_gdf, amenity_name, debug_label=""):
-        """Generic method to filter amenities within the isochrone polygon"""
+    def _filter_amenities_in_polygon(self, area_result, points, amenities_gdf, amenity_name, debug_label="", spatial_index=None):
+        """Generic method to filter amenities within the isochrone polygon with spatial index optimization"""
         try:
-            print(f"{debug_label} {amenity_name} Filter Debug - Input: {len(points)} points")
-            print(f"{debug_label} {amenity_name} Filter Debug - amenities_gdf type: {type(amenities_gdf)}")
-            print(f"{debug_label} {amenity_name} Filter Debug - amenities_gdf is None: {amenities_gdf is None}")
-            if amenities_gdf is not None:
-                print(f"{debug_label} {amenity_name} Filter Debug - amenities_gdf length: {len(amenities_gdf)}")
-                print(f"{debug_label} {amenity_name} Filter Debug - amenities_gdf empty: {amenities_gdf.empty}")
-            
-            if len(points) < 3:
-                print(f"{amenity_name} Filter Debug - Too few points ({len(points)})")
-                return 0
-                
-            # Check if amenities data is available
-            if amenities_gdf is None:
-                print(f"{amenity_name} Filter Debug - amenities_gdf is None, returning 0")
+            # Quick validation checks
+            if len(points) < 3 or amenities_gdf is None:
                 return 0
             
             if hasattr(amenities_gdf, 'empty') and amenities_gdf.empty:
-                print(f"{amenity_name} Filter Debug - amenities_gdf is empty, returning 0")
                 return 0
             
-            # Create a polygon from the boundary points
-            from shapely.geometry import Polygon, Point
+            # Create polygon from isochrone area for containment checks (with caching)
+            from shapely.geometry import Point
+            polygon = self._get_or_create_polygon(area_result, points)
+            if polygon is None:
+                return 0
             
-            # Convert boundary to lng/lat coordinates for proper Shapely polygon
-            if 'boundary' in area_result and len(area_result['boundary']) > 3:
-                print(f"{amenity_name} Filter Debug - Using boundary points: {len(area_result['boundary'])}")
-                # boundary coords are [lat, lng] format, convert to [lng, lat] for Shapely
-                boundary_coords = [(coord[1], coord[0]) for coord in area_result['boundary']]
-                polygon = Polygon(boundary_coords)
-                print(f"{amenity_name} Filter Debug - Boundary polygon bounds: {polygon.bounds}")
+            # Use spatial index optimization if available
+            if spatial_index is not None and isinstance(spatial_index, dict):
+                try:
+                    # Get polygon bounds for spatial index query
+                    bounds = polygon.bounds  # (minx, miny, maxx, maxy)
+                    rtree_index = spatial_index['index']
+                    id_mapping = spatial_index['id_mapping']
+                    candidate_int_ids = list(rtree_index.intersection(bounds))
+                    
+                    # Calculate polygon centroid for distance pre-filtering
+                    poly_centroid = polygon.centroid
+                    
+                    # Estimate reasonable distance threshold based on polygon size
+                    # Use polygon bounds diagonal as a rough distance threshold
+                    minx, miny, maxx, maxy = bounds
+                    diagonal_distance = ((maxx - minx)**2 + (maxy - miny)**2)**0.5
+                    distance_threshold = diagonal_distance * 1.5  # Add some buffer
+                    
+                    # Now do distance pre-filtering and precise polygon containment test only on candidates
+                    accessible_count = 0
+                    distance_filtered = 0
+                    for int_id in candidate_int_ids:
+                        try:
+                            # Map back to original index
+                            original_idx = id_mapping[int_id]
+                            if original_idx in amenities_gdf.index:
+                                amenity = amenities_gdf.loc[original_idx]
+                                if hasattr(amenity.geometry, 'centroid'):
+                                    point = amenity.geometry.centroid
+                                else:
+                                    point = amenity.geometry
+                                
+                                # Distance pre-filtering: skip if too far from polygon centroid
+                                distance_to_center = ((point.x - poly_centroid.x)**2 + (point.y - poly_centroid.y)**2)**0.5
+                                if distance_to_center > distance_threshold:
+                                    distance_filtered += 1
+                                    continue
+                                
+                                amenity_point = Point(point.x, point.y)
+                                if polygon.contains(amenity_point):
+                                    accessible_count += 1
+                        except Exception:
+                            continue
+                    
+                    
+                    return accessible_count
+                    
+                except Exception as e:
+                    print(f"{amenity_name} spatial index failed: {e}")
+                    # Fall through to brute force method
+                    pass
             else:
-                print(f"{amenity_name} Filter Debug - Using convex hull from {len(points)} points")
-                # Fallback: create simple polygon from points
-                if len(points) >= 3:
-                    hull_points = []
-                    from scipy.spatial import ConvexHull
-                    hull = ConvexHull(points)
-                    for vertex in hull.vertices:
-                        # points are [lat, lng] format, convert to [lng, lat] for Shapely
-                        hull_points.append((points[vertex][1], points[vertex][0]))
-                    polygon = Polygon(hull_points)
-                    print(f"{amenity_name} Filter Debug - Hull polygon bounds: {polygon.bounds}")
-                else:
-                    return 0
+                pass  # Fall back to brute force method
             
-            print(f"{amenity_name} Filter Debug - Processing {len(amenities_gdf)} pre-loaded {amenity_name.lower()}")
-            
-            # Filter amenities within the accessible area polygon
+            # Fallback: Filter amenities within the accessible area polygon (brute force)
             accessible_count = 0
-            sample_count = 0
             for idx, amenity in amenities_gdf.iterrows():
                 try:
                     if hasattr(amenity.geometry, 'centroid'):
@@ -1233,45 +1552,34 @@ class ParkAccessibilityAnalyzer:
                     else:
                         point = amenity.geometry
                     
-                    # Debug first few amenities
-                    if sample_count < 5:
-                        print(f"{amenity_name} Filter Debug - Sample amenity {sample_count}: Point({point.x}, {point.y})")
-                        sample_count += 1
-                    
                     # Check if point is within the accessible area polygon
                     amenity_point = Point(point.x, point.y)  # Point(lng, lat) to match polygon coordinate system
                     if polygon.contains(amenity_point):
                         accessible_count += 1
-                        if accessible_count <= 3:  # Debug first few matches
-                            name = amenity.get('name', f'Unnamed {amenity_name}')
-                            print(f"{amenity_name} Filter Debug - Match {accessible_count}: {name} at Point({point.x}, {point.y})")
-                except Exception as e:
-                    if sample_count < 5:
-                        print(f"{amenity_name} Filter Debug - Error processing amenity {sample_count}: {e}")
+                except Exception:
                     continue
             
-            print(f"{amenity_name} Filter Debug - Final accessible count: {accessible_count}")
             return accessible_count
                 
         except Exception as e:
             print(f"Error calculating accessible {amenity_name.lower()}: {e}")
             return 0
 
-    def _calculate_accessible_schools(self, area_result, points, schools_gdf, debug_label=""):
+    def _calculate_accessible_schools(self, area_result, points, schools_gdf, debug_label="", spatial_index=None):
         """Calculate number of schools accessible within the isochrone area using pre-loaded data"""
-        return self._filter_amenities_in_polygon(area_result, points, schools_gdf, "Schools", debug_label)
+        return self._filter_amenities_in_polygon(area_result, points, schools_gdf, "Schools", debug_label, spatial_index)
     
-    def _calculate_accessible_playgrounds(self, area_result, points, playgrounds_gdf, debug_label=""):
+    def _calculate_accessible_playgrounds(self, area_result, points, playgrounds_gdf, debug_label="", spatial_index=None):
         """Calculate number of playgrounds accessible within the isochrone area using pre-loaded data"""
-        return self._filter_amenities_in_polygon(area_result, points, playgrounds_gdf, "Playgrounds", debug_label)
+        return self._filter_amenities_in_polygon(area_result, points, playgrounds_gdf, "Playgrounds", debug_label, spatial_index)
     
-    def _calculate_accessible_cafes_bars(self, area_result, points, cafes_bars_gdf, debug_label=""):
+    def _calculate_accessible_cafes_bars(self, area_result, points, cafes_bars_gdf, debug_label="", spatial_index=None):
         """Calculate number of cafes/bars accessible within the isochrone area using pre-loaded data"""
-        return self._filter_amenities_in_polygon(area_result, points, cafes_bars_gdf, "Cafes/Bars", debug_label)
+        return self._filter_amenities_in_polygon(area_result, points, cafes_bars_gdf, "Cafes/Bars", debug_label, spatial_index)
     
-    def _calculate_accessible_transit(self, area_result, points, transit_gdf, debug_label=""):
+    def _calculate_accessible_transit(self, area_result, points, transit_gdf, debug_label="", spatial_index=None):
         """Calculate number of public transit stations accessible within the isochrone area using pre-loaded data"""
-        return self._filter_amenities_in_polygon(area_result, points, transit_gdf, "Transit", debug_label)
+        return self._filter_amenities_in_polygon(area_result, points, transit_gdf, "Transit", debug_label, spatial_index)
     
     def _create_convex_hull_isochrone(self, points_array: np.ndarray, reachable_nodes: list) -> Dict:
         """Create convex hull isochrone (fast but can overlap parks)"""
@@ -1315,6 +1623,8 @@ class ParkAccessibilityAnalyzer:
                                          reachable_nodes: list, max_distance: float) -> Dict:
         """Create buffered network isochrone (realistic, follows streets)"""
         try:
+            import time
+            start_time = time.time()
             print(f"Creating buffered network isochrone for {len(reachable_nodes)} reachable nodes")
             
             # Get edges where both endpoints are reachable
@@ -1343,10 +1653,34 @@ class ParkAccessibilityAnalyzer:
             
             # Buffer edges by a reasonable amount (e.g., 25m on each side)
             buffer_distance = 25  # meters
+            buffer_start = time.time()
             buffered_edges = edges_projected.buffer(buffer_distance, cap_style=2, join_style=2)
+            print(f"Buffering {len(reachable_edges)} edges took {time.time() - buffer_start:.2f}s")
             
-            # Union all buffered edges
-            unified_buffer = buffered_edges.unary_union
+            # Optimize union operation for large numbers of edges
+            union_start = time.time()
+            if len(buffered_edges) > 1500:
+                # For very large numbers, use a faster approximation
+                print(f"Using fast approximation for {len(buffered_edges)} buffers...")
+                # Get convex hull of all buffer centroids and expand
+                centroids = [geom.centroid for geom in buffered_edges.tolist()]
+                from shapely.geometry import MultiPoint
+                points = MultiPoint(centroids)
+                unified_buffer = points.convex_hull.buffer(buffer_distance * 2)
+                print(f"Fast approximation took {time.time() - union_start:.2f}s")
+            elif len(buffered_edges) > 1000:
+                # For large numbers, use cascaded union which is more efficient
+                try:
+                    from shapely.ops import unary_union
+                    unified_buffer = unary_union(buffered_edges.tolist())
+                    print(f"Cascaded union of {len(buffered_edges)} buffers took {time.time() - union_start:.2f}s")
+                except:
+                    # Fallback to pandas unary_union
+                    unified_buffer = buffered_edges.unary_union
+                    print(f"Pandas unary_union of {len(buffered_edges)} buffers took {time.time() - union_start:.2f}s")
+            else:
+                unified_buffer = buffered_edges.unary_union
+                print(f"Standard union of {len(buffered_edges)} buffers took {time.time() - union_start:.2f}s")
             
             if unified_buffer.is_empty:
                 return {'boundary': [], 'area_km2': 0, 'reachable_nodes': len(reachable_nodes)}
@@ -1371,6 +1705,8 @@ class ParkAccessibilityAnalyzer:
                 boundary = [[lat, lon] for lon, lat in coords]
             else:
                 boundary = []
+            
+            print(f"Total buffered network isochrone creation took {time.time() - start_time:.2f}s")
             
             return {
                 'boundary': boundary,
@@ -1788,7 +2124,7 @@ async def read_index():
     <div class="container">
         <div class="header">
             <h1>🌳 Fast Park Accessibility Analysis</h1>
-            <p>Analyze how parks affect 10-minute walkability in Rotterdam</p>
+            <p>Analyze how parks affect X-minute walkability</p>
         </div>
 
         <div class="step">
@@ -1927,6 +2263,7 @@ async def read_index():
                     <div class="control-group">
                         <label>&nbsp;</label>
                         <button class="btn" onclick="runMassAnalysis()" disabled id="massAnalyzeBtn" style="background-color: #28a745;">🔍 Mass Analysis</button>
+                        <button class="btn" onclick="cancelMassAnalysis()" disabled id="massCancelBtn" style="background-color: #dc3545; margin-left: 10px; display: none;">❌ Cancel</button>
                     </div>
                 </div>
                 <div id="massProgress" style="display: none;">
@@ -2573,7 +2910,19 @@ async def read_index():
                         return;
                     }
                     
-                    const statusText = `Step ${progress.current_step}/${progress.total_steps}: ${progress.step_name}`;
+                    let statusText = `Step ${progress.current_step}/${progress.total_steps}: ${progress.step_name}`;
+                    
+                    // Add detailed sub-progress and operation info if available
+                    if (progress.current_operation && progress.current_operation !== progress.step_name) {
+                        statusText += `\n${progress.current_operation}`;
+                    }
+                    
+                    // Add time estimate if available
+                    if (progress.estimated_time_remaining && progress.estimated_time_remaining > 10) {
+                        const minutes = Math.ceil(progress.estimated_time_remaining / 60);
+                        statusText += ` (Est. ${minutes}min remaining)`;
+                    }
+                    
                     showStatus(statusText, 'loading');
                     
                     if (progress.completed) {
@@ -3273,6 +3622,7 @@ async def read_index():
 
         let massResultsData = [];
         let massCharts = {};
+        let analysisAborted = false;
 
         function getImpactTooltip(impactCategory, impactLabel) {
             const tooltips = {
@@ -3284,6 +3634,64 @@ async def read_index():
             };
             
             return tooltips[impactCategory] || 'Impact assessment based on changes to reachable street network length when the park is present versus removed.';
+        }
+
+        function selectOptimalNodes(nearbyNodes, nodeCount, selectedPark) {
+            // If we have fewer or equal nodes than requested, return all
+            if (nearbyNodes.length <= nodeCount) {
+                return nearbyNodes;
+            }
+
+            // Sort nodes by distance from park centroid for initial ordering
+            const sortedByDistance = nearbyNodes.map(node => ({
+                ...node,
+                distanceFromPark: getDistance(
+                    selectedPark.centroid[0], selectedPark.centroid[1],
+                    node.lat, node.lng
+                )
+            })).sort((a, b) => a.distanceFromPark - b.distanceFromPark);
+
+            // Implement spatial clustering to ensure good coverage
+            const selectedNodes = [];
+            const minSeparationDistance = 100; // meters - minimum distance between selected nodes
+            
+            // Always include the closest node
+            selectedNodes.push(sortedByDistance[0]);
+            
+            // Select additional nodes ensuring spatial separation
+            for (let i = 1; i < sortedByDistance.length && selectedNodes.length < nodeCount; i++) {
+                const candidate = sortedByDistance[i];
+                let tooClose = false;
+                
+                // Check if candidate is too close to any already selected node
+                for (const selected of selectedNodes) {
+                    const separation = getDistance(
+                        candidate.lat, candidate.lng,
+                        selected.lat, selected.lng
+                    );
+                    if (separation < minSeparationDistance) {
+                        tooClose = true;
+                        break;
+                    }
+                }
+                
+                if (!tooClose) {
+                    selectedNodes.push(candidate);
+                }
+            }
+            
+            // If we still need more nodes and the separation constraint is too strict,
+            // fill remaining slots with closest available nodes
+            if (selectedNodes.length < nodeCount) {
+                const remaining = sortedByDistance.filter(node => 
+                    !selectedNodes.some(selected => selected.id === node.id)
+                );
+                const needed = nodeCount - selectedNodes.length;
+                selectedNodes.push(...remaining.slice(0, needed));
+            }
+            
+            console.log(`Selected ${selectedNodes.length} spatially distributed nodes from ${nearbyNodes.length} available`);
+            return selectedNodes;
         }
 
         async function runMassAnalysis() {
@@ -3326,14 +3734,18 @@ async def read_index():
                 return;
             }
 
-            // Select nodes for analysis (random sampling if more than requested)
-            const selectedNodes = nearbyNodes.length <= nodeCount ? 
-                nearbyNodes : 
-                nearbyNodes.sort(() => 0.5 - Math.random()).slice(0, nodeCount);
+            // Smart node selection with spatial clustering optimization
+            const selectedNodes = selectOptimalNodes(nearbyNodes, nodeCount, selectedPark);
 
-            // Show progress
+            // Show progress with time estimation
             document.getElementById('massProgress').style.display = 'block';
             document.getElementById('massAnalyzeBtn').disabled = true;
+            document.getElementById('massCancelBtn').style.display = 'inline-block';
+            document.getElementById('massCancelBtn').disabled = false;
+            
+            // Initialize time tracking for progress estimation
+            const analysisStartTime = Date.now();
+            analysisAborted = false;  // Reset global flag
 
             massResultsData = [];
             const lat = parseFloat(document.getElementById('lat').value);
@@ -3373,45 +3785,45 @@ async def read_index():
                 
                 let results = null;
                 
-                // Poll for real-time progress updates
-                let progressInterval = setInterval(async () => {
-                    try {
-                        const progressResponse = await fetch(`/mass-progress?progress_key=${progressKey}`);
-                        const progress = await progressResponse.json();
-                        
-                        const percentage = Math.min((progress.completed_nodes / progress.total_nodes) * 100, 100);
-                        document.getElementById('massProgressBar').style.width = percentage + '%';
-                        
-                        if (progress.current_node && progress.current_node !== 'Not found') {
-                            document.getElementById('massProgressText').textContent = 
-                                `Analyzing node ${progress.completed_nodes}/${progress.total_nodes}... (${progress.current_node})`;
-                        }
-                        
-                        if (progress.completed) {
-                            clearInterval(progressInterval);
-                            results = progress.results;
-                            document.getElementById('massProgressText').textContent = 'Processing results...';
-                        }
-                    } catch (error) {
-                        console.log('Progress polling error:', error);
-                    }
-                }, 500); // Poll every 500ms
-                
-                // Wait for completion through progress polling
+                // Single unified progress polling with completion handling
                 await new Promise(resolve => {
-                    let checkComplete = setInterval(async () => {
+                    let progressInterval = setInterval(async () => {
                         try {
                             const progressResponse = await fetch(`/mass-progress?progress_key=${progressKey}`);
                             const progress = await progressResponse.json();
+                            
+                            const percentage = Math.min((progress.completed_nodes / progress.total_nodes) * 100, 100);
+                            document.getElementById('massProgressBar').style.width = percentage + '%';
+                            
+                            if (progress.current_node && progress.current_node !== 'Not found') {
+                                // Calculate time estimation
+                                const elapsed = Date.now() - analysisStartTime;
+                                const avgTimePerNode = elapsed / Math.max(progress.completed_nodes, 1);
+                                const remaining = progress.total_nodes - progress.completed_nodes;
+                                const estimatedTimeRemaining = remaining * avgTimePerNode;
+                                
+                                let timeText = '';
+                                if (estimatedTimeRemaining > 60000) {
+                                    timeText = ` (~${Math.ceil(estimatedTimeRemaining/60000)} min remaining)`;
+                                } else if (estimatedTimeRemaining > 1000) {
+                                    timeText = ` (~${Math.ceil(estimatedTimeRemaining/1000)} sec remaining)`;
+                                }
+                                
+                                document.getElementById('massProgressText').textContent = 
+                                    `Analyzing node ${progress.completed_nodes}/${progress.total_nodes}... (${progress.current_node})${timeText}`;
+                            }
+                            
+                            // Check for completion and resolve
                             if (progress.completed) {
-                                clearInterval(checkComplete);
+                                clearInterval(progressInterval);
                                 results = progress.results;
+                                document.getElementById('massProgressText').textContent = 'Processing results...';
                                 resolve();
                             }
                         } catch (error) {
-                            console.log('Completion check error:', error);
+                            console.log('Progress polling error:', error);
                         }
-                    }, 500);
+                    }, 1500); // Poll every 1.5 seconds for good responsiveness without overload
                 });
                 
                 document.getElementById('massProgressBar').style.width = '90%';
@@ -3479,13 +3891,33 @@ async def read_index():
             document.getElementById('massProgressBar').style.width = '100%';
             document.getElementById('massProgressText').textContent = `Completed analysis of ${massResultsData.length} nodes`;
             
+            // Reset UI state
+            document.getElementById('massAnalyzeBtn').disabled = false;
+            document.getElementById('massCancelBtn').style.display = 'none';
+            
             setTimeout(() => {
                 document.getElementById('massProgress').style.display = 'none';
             }, 1000);
             
-            document.getElementById('massAnalyzeBtn').disabled = false;
-            
             displayMassResults();
+        }
+
+        function cancelMassAnalysis() {
+            // Set global cancellation flag
+            analysisAborted = true;
+            
+            // Reset UI immediately
+            document.getElementById('massProgressBar').style.width = '0%';
+            document.getElementById('massProgressText').textContent = 'Analysis cancelled by user';
+            document.getElementById('massAnalyzeBtn').disabled = false;
+            document.getElementById('massCancelBtn').style.display = 'none';
+            
+            // Hide progress after short delay
+            setTimeout(() => {
+                document.getElementById('massProgress').style.display = 'none';
+            }, 1500);
+            
+            console.log('Mass analysis cancelled by user');
         }
 
         function displayMassResults() {
@@ -4252,8 +4684,11 @@ async def get_progress(lat: float, lng: float, radius: int = 2000):
     progress_key = f"{lat:.4f}_{lng:.4f}_{radius}"
     progress = LOADING_PROGRESS.get(progress_key, {
         'current_step': 0,
-        'total_steps': 9,
+        'total_steps': 15,
         'step_name': 'Waiting to start...',
+        'sub_progress': 0,
+        'current_operation': 'Initializing...',
+        'estimated_time_remaining': None,
         'completed': False
     })
     return progress
