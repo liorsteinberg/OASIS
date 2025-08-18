@@ -879,11 +879,17 @@ class ParkAccessibilityAnalyzer:
         }
         
         # Run batch analysis in thread pool
-        loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(
-            executor, self._calculate_mass_accessibility_sync, 
-            data, park_id, node_ids, walk_time, walk_speed, viz_method, network_backend, progress_key
-        )
+        print(f"Starting mass analysis thread pool execution for {len(node_ids)} nodes")
+        try:
+            loop = asyncio.get_event_loop()
+            results = await loop.run_in_executor(
+                executor, self._calculate_mass_accessibility_sync, 
+                data, park_id, node_ids, walk_time, walk_speed, viz_method, network_backend, progress_key
+            )
+            print(f"Mass analysis thread pool completed successfully with {len(results) if results else 0} results")
+        except Exception as e:
+            print(f"Mass analysis thread pool failed: {e}")
+            raise
         
         return results
     
@@ -3856,7 +3862,23 @@ async def read_index():
                             // Check for completion and resolve
                             if (progress.completed) {
                                 clearInterval(progressInterval);
+                                
+                                // Check for server-side errors
+                                if (progress.error) {
+                                    console.error('Mass analysis failed on server:', progress.error);
+                                    alert(`Mass analysis failed: ${progress.error}`);
+                                    return;
+                                }
+                                
                                 results = progress.results;
+                                console.log('Mass analysis completed. Results:', results);
+                                
+                                if (!results) {
+                                    console.error('Mass analysis completed but no results found');
+                                    alert('Mass analysis completed but returned no results. Check server logs for errors.');
+                                    return;
+                                }
+                                
                                 document.getElementById('massProgressText').textContent = 'Processing results...';
                                 resolve();
                             }
@@ -3870,6 +3892,15 @@ async def read_index():
                 document.getElementById('massProgressText').textContent = 'Processing batch results...';
                 
                 if (response.ok) {
+                    // Check if results is actually an array
+                    if (!Array.isArray(results)) {
+                        console.error('Invalid response format:', results);
+                        alert(`Mass analysis failed: Server returned invalid response format. Response: ${JSON.stringify(results)}`);
+                        return;
+                    }
+                    
+                    console.log(`Received ${results.length} results from server`);
+                    
                     // Process batch results
                     for (let result of results) {
                         if (result.error) {
@@ -3931,7 +3962,10 @@ async def read_index():
                         });
                     }
                 } else {
-                    throw new Error(`Batch analysis failed: ${results.detail || 'Unknown error'}`);
+                    // Server returned an error response
+                    const errorMessage = results?.detail || results?.message || `Server error ${response.status}`;
+                    console.error('Server error response:', results);
+                    throw new Error(`Batch analysis failed: ${errorMessage}`);
                 }
             } catch (error) {
                 console.error('Error in mass analysis:', error);
