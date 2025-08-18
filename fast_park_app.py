@@ -744,6 +744,7 @@ class ParkAccessibilityAnalyzer:
             update_sub_progress(80, "Building spatial indexes for fast amenity filtering...")
             try:
                 from rtree import index
+                print("✓ rtree library available for spatial indexing")
                 # Create spatial indexes for each amenity type
                 amenity_indexes = {}
                 amenity_data = {
@@ -773,10 +774,12 @@ class ParkAccessibilityAnalyzer:
                         print(f"✗ No {amenity_type} data, spatial index set to None")
                         
             except ImportError:
-                print("rtree not available, falling back to brute force spatial filtering")
+                print("❌ rtree not available, falling back to brute force spatial filtering")
+                print("   This may cause performance issues on Heroku deployments")
                 amenity_indexes = {}
             except Exception as e:
-                print(f"Failed to create spatial indexes: {e}")
+                print(f"❌ Failed to create spatial indexes: {e}")
+                print("   This may cause performance issues on Heroku deployments")
                 amenity_indexes = {}
             
             
@@ -964,6 +967,16 @@ class ParkAccessibilityAnalyzer:
                     
                     print(f"Processing node {node_id}...")
                     
+                    # Memory check before processing (important for Heroku)
+                    try:
+                        import psutil
+                        process = psutil.Process()
+                        memory_mb = process.memory_info().rss / 1024 / 1024
+                        if memory_mb > 450:  # Heroku free tier ~512MB limit
+                            print(f"WARNING: High memory usage before node {node_id}: {memory_mb:.1f} MB")
+                    except ImportError:
+                        pass  # psutil not available
+                    
                     # Extract dynamic subgraph around this node
                     local_subgraph = self._extract_local_subgraph(graph, nodes_gdf, node_key, max_distance)
                     
@@ -1093,10 +1106,26 @@ class ParkAccessibilityAnalyzer:
                         print(f"Completed node {node_id} ({len(results)}/{len(node_ids)})")
                     except Exception as e:
                         print(f"Node {node_id} failed: {e}")
+                        import traceback
+                        print(f"Node {node_id} traceback:")
+                        traceback.print_exc()
+                        
+                        # Add detailed error info for node failure debugging
+                        node_error_details = {
+                            'node_id': node_id,
+                            'error_type': type(e).__name__,
+                            'error_message': str(e),
+                            'graph_nodes': len(graph) if 'graph' in locals() else 'unknown',
+                            'nodes_gdf_size': len(nodes_gdf) if 'nodes_gdf' in locals() else 'unknown',
+                            'park_exists': park_key is not None if 'park_key' in locals() else 'unknown'
+                        }
+                        print(f"Node {node_id} error details: {node_error_details}")
+                        
                         results.append({
                             'node_id': node_id,
                             'error': str(e),
-                            'park_id': park_id
+                            'park_id': park_id,
+                            'error_details': node_error_details
                         })
                         
                         # Update progress even for failed nodes
@@ -1140,7 +1169,18 @@ class ParkAccessibilityAnalyzer:
             print(f"Exception in _calculate_mass_accessibility_sync: {e}")
             import traceback
             traceback.print_exc()
-            raise Exception(f"Failed to calculate mass accessibility: {str(e)}")
+            
+            # Add detailed error information for debugging deployment issues
+            error_details = {
+                'error_type': type(e).__name__,
+                'error_message': str(e),
+                'park_id': park_id,
+                'node_ids_count': len(node_ids) if 'node_ids' in locals() else 'unknown',
+                'available_parks': len(parks_gdf) if 'parks_gdf' in locals() else 'unknown'
+            }
+            print(f"Mass analysis error details: {error_details}")
+            
+            raise Exception(f"Failed to calculate mass accessibility: {str(e)} | Details: {error_details}")
     
     def _calculate_accessibility_sync(self, data: Dict, park_id: str, node_id: str, 
                                      walk_time: float, walk_speed: float, viz_method: str,
@@ -3834,6 +3874,17 @@ async def read_index():
                     for (let result of results) {
                         if (result.error) {
                             console.error(`Error for node ${result.node_id}:`, result.error);
+                            if (result.error_details) {
+                                console.error(`Node ${result.node_id} error details:`, result.error_details);
+                            }
+                            // Skip adding failed nodes to results display
+                            continue;
+                        }
+                        
+                        // Only process successful results with valid park_id
+                        if (!result.park_id || !result.with_park || !result.without_park) {
+                            console.error(`Invalid result structure for node ${result.node_id}:`, result);
+                            continue;
                         }
                         
                         // Find the node data to get coordinates
@@ -3898,6 +3949,15 @@ async def read_index():
             setTimeout(() => {
                 document.getElementById('massProgress').style.display = 'none';
             }, 1000);
+            
+            // Check if we have any successful results
+            const failedNodes = selectedNodes.length - massResultsData.length;
+            if (failedNodes > 0 && massResultsData.length > 0) {
+                console.warn(`${failedNodes} nodes failed during analysis`);
+            } else if (massResultsData.length === 0) {
+                alert(`Analysis failed: No successful results. All ${failedNodes} nodes failed. This is likely due to memory constraints or missing dependencies on the server. Check browser console and server logs for details.`);
+                return;
+            }
             
             displayMassResults();
         }
